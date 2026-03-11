@@ -39,8 +39,14 @@ type CogneePluginConfig = {
   autoRecall?: boolean;
   autoIndex?: boolean;
   autoCognify?: boolean;
+  pinnedPaths?: string[];
+  pinnedMaxResults?: number;
+  memoryStoreMaxChars?: number;
   requestTimeoutMs?: number;
   ingestionTimeoutMs?: number;
+  summaryModel?: string;
+  summaryProvider?: string;
+  summaryMaxTokens?: number;
   datasets?: Partial<Record<DatasetKey, DatasetProfileConfig>>;
 };
 
@@ -57,6 +63,12 @@ type ResolvedCogneePluginConfig = {
   maxTokens: number;
   requestTimeoutMs: number;
   ingestionTimeoutMs: number;
+  pinnedPaths: string[];
+  pinnedMaxResults: number;
+  memoryStoreMaxChars: number;
+  summaryModel: string;
+  summaryProvider: string;
+  summaryMaxTokens: number;
   datasets: Record<DatasetKey, ResolvedDatasetProfile>;
 };
 
@@ -135,6 +147,37 @@ type LibrarySource = {
   isFile: boolean;
 };
 
+type RetainedLibraryAsset = {
+  assetId: string;
+  title: string;
+  originalPath?: string;
+  importedAt: string;
+  contentHash: string;
+  storagePath: string;
+  virtualPath: string;
+};
+
+type RetainedLibraryManifest = {
+  assets: RetainedLibraryAsset[];
+};
+
+type CompactionArtifact = {
+  artifactId: string;
+  sourcePath: string;
+  sourceHash: string;
+  createdAt: string;
+  replacementPath: string;
+  replacementKind: "distilled-memory";
+  status: "ready" | "applied";
+  summaryMode?: "llm-distilled" | "preserved-copy";
+  summaryModelRef?: string;
+  lastRebuiltAt?: string;
+};
+
+type CompactionManifest = {
+  artifacts: CompactionArtifact[];
+};
+
 type RankedSearchResult = {
   dataset: DatasetKey;
   path: string;
@@ -151,6 +194,54 @@ type CleanupSuggestion = {
   reason: string;
 };
 
+type CompactSuggestion = {
+  path: string;
+  reason: string;
+};
+
+type RuntimeModelAuthResult = {
+  apiKey?: string;
+};
+
+type RuntimeModelAuthModel = {
+  id: string;
+  provider: string;
+  api: string;
+  name?: string;
+  reasoning?: boolean;
+  input?: string[];
+  cost?: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+  };
+  contextWindow?: number;
+  maxTokens?: number;
+};
+
+type RuntimeModelAuth = {
+  getApiKeyForModel?: (params: {
+    model: RuntimeModelAuthModel;
+    cfg?: OpenClawPluginApi["config"];
+    profileId?: string;
+    preferredProfile?: string;
+  }) => Promise<RuntimeModelAuthResult | undefined>;
+  resolveApiKeyForProvider?: (params: {
+    provider: string;
+    cfg?: OpenClawPluginApi["config"];
+    profileId?: string;
+    preferredProfile?: string;
+  }) => Promise<RuntimeModelAuthResult | undefined>;
+};
+
+type DistilledSummaryResult = {
+  body: string;
+  summaryMode: "llm-distilled" | "preserved-copy";
+  summaryModelRef?: string;
+  fallbackReason?: string;
+};
+
 const DEFAULT_BASE_URL = "http://localhost:8000";
 const DEFAULT_MEMORY_DATASET_NAME = "openclaw-memory";
 const DEFAULT_LIBRARY_DATASET_NAME = "openclaw-library";
@@ -162,6 +253,9 @@ const DEFAULT_MIN_SCORE = 0;
 const DEFAULT_MAX_TOKENS = 512;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const DEFAULT_INGESTION_TIMEOUT_MS = 300_000;
+const DEFAULT_PINNED_MAX_RESULTS = 2;
+const DEFAULT_MEMORY_STORE_MAX_CHARS = 4_000;
+const DEFAULT_SUMMARY_MAX_TOKENS = 900;
 const DEFAULT_MEMORY_AUTO_INDEX = true;
 const DEFAULT_MEMORY_AUTO_COGNIFY = true;
 const DEFAULT_MEMORY_AUTO_RECALL = true;
@@ -170,12 +264,21 @@ const DEFAULT_LIBRARY_AUTO_COGNIFY = false;
 const DEFAULT_LIBRARY_AUTO_RECALL = false;
 const MAX_RETRIES = 2;
 const RETRY_BASE_DELAY_MS = 3_000;
+const TOOL_NOTE_DIRNAME = "_tool";
+const MANAGED_BY_MARKER = "cognee-openclaw";
+const LEGACY_MANAGED_BY_MARKERS = new Set(["cognee-openclaw", "memory-cognee-revised"]);
 
 const COGNEE_ROOT = join(homedir(), ".openclaw", "memory", "cognee");
 const STATE_PATH = join(COGNEE_ROOT, "datasets.json");
 const LEGACY_SYNC_INDEX_PATH = join(COGNEE_ROOT, "sync-index.json");
 const SYNC_INDEX_DIR = join(COGNEE_ROOT, "sync-indexes");
 const RANKING_DIR = join(COGNEE_ROOT, "ranking");
+const ASSETS_DIR = join(COGNEE_ROOT, "assets");
+const LIBRARY_ASSETS_DIR = join(ASSETS_DIR, "library");
+const LIBRARY_ASSET_BLOBS_DIR = join(LIBRARY_ASSETS_DIR, "blobs");
+const LIBRARY_ASSET_MANIFEST_PATH = join(LIBRARY_ASSETS_DIR, "manifest.json");
+const COMPACTION_DIR = join(COGNEE_ROOT, "compaction");
+const COMPACTION_MANIFEST_PATH = join(COMPACTION_DIR, "manifest.json");
 const OPENCLAW_CONFIG_PATH = join(homedir(), ".openclaw", "openclaw.json");
 
 function resolveEnvVars(value: string): string {
@@ -188,6 +291,10 @@ function resolveEnvVars(value: string): string {
   });
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
 function hashText(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -198,6 +305,370 @@ function toPosixPath(value: string): string {
 
 function normalizeDatasetPath(value: string): string {
   return toPosixPath(value).replace(/^\.\/+/, "").replace(/\/+/g, "/");
+}
+
+function normalizeProviderId(provider: string): string {
+  return provider.trim().toLowerCase();
+}
+
+function inferApiFromProvider(provider: string): string {
+  const normalized = normalizeProviderId(provider);
+  const map: Record<string, string> = {
+    anthropic: "anthropic-messages",
+    openai: "openai-responses",
+    "openai-codex": "openai-codex-responses",
+    "github-copilot": "openai-codex-responses",
+    google: "google-generative-ai",
+    "google-gemini-cli": "google-gemini-cli",
+    "google-antigravity": "google-gemini-cli",
+    "google-vertex": "google-vertex",
+    "amazon-bedrock": "bedrock-converse-stream",
+  };
+  return map[normalized] ?? "openai-responses";
+}
+
+function findProviderConfigValue<T>(map: Record<string, T> | undefined, provider: string): T | undefined {
+  if (!map) {
+    return undefined;
+  }
+  if (map[provider] !== undefined) {
+    return map[provider];
+  }
+  const normalized = normalizeProviderId(provider);
+  for (const [key, value] of Object.entries(map)) {
+    if (normalizeProviderId(key) === normalized) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function getRuntimeModelAuth(api: OpenClawPluginApi): RuntimeModelAuth | undefined {
+  const runtime = api.runtime as OpenClawPluginApi["runtime"] & {
+    modelAuth?: RuntimeModelAuth;
+  };
+  return runtime.modelAuth;
+}
+
+function resolveApiKeyFromAuthResult(auth: RuntimeModelAuthResult | undefined): string | undefined {
+  const apiKey = auth?.apiKey?.trim();
+  return apiKey ? apiKey : undefined;
+}
+
+function readDefaultModelRefFromConfig(config: unknown): string {
+  if (!isRecord(config)) {
+    return "";
+  }
+  const agents = isRecord(config.agents) ? config.agents : undefined;
+  const defaults = isRecord(agents?.defaults)
+    ? agents.defaults
+    : isRecord(agents?.default)
+      ? agents.default
+      : undefined;
+  const model = defaults?.model;
+  if (typeof model === "string") {
+    return model.trim();
+  }
+  if (isRecord(model) && typeof model.primary === "string") {
+    return model.primary.trim();
+  }
+  return "";
+}
+
+function resolveSummaryModelSelection(
+  pluginConfig: unknown,
+  runtimeConfig: unknown,
+): { provider: string; model: string; modelRef: string } | undefined {
+  const pluginRecord = isRecord(pluginConfig) ? pluginConfig : undefined;
+  const configuredModel = typeof pluginRecord?.summaryModel === "string" ? pluginRecord.summaryModel.trim() : "";
+  const configuredProvider =
+    typeof pluginRecord?.summaryProvider === "string" ? pluginRecord.summaryProvider.trim() : "";
+  const rawModelRef =
+    configuredModel ||
+    readDefaultModelRefFromConfig(runtimeConfig) ||
+    process.env.OPENCLAW_DEFAULT_MODEL?.trim() ||
+    "";
+
+  if (!rawModelRef) {
+    return undefined;
+  }
+
+  if (rawModelRef.includes("/")) {
+    const [provider, ...rest] = rawModelRef.split("/");
+    const model = rest.join("/").trim();
+    const resolvedProvider = configuredProvider || provider.trim();
+    if (resolvedProvider && model) {
+      return {
+        provider: resolvedProvider,
+        model,
+        modelRef: `${resolvedProvider}/${model}`,
+      };
+    }
+  }
+
+  const provider = configuredProvider || process.env.OPENCLAW_PROVIDER?.trim() || "";
+  if (!provider) {
+    return undefined;
+  }
+  return {
+    provider,
+    model: rawModelRef,
+    modelRef: `${provider}/${rawModelRef}`,
+  };
+}
+
+function parseBooleanLike(value: string): boolean | undefined {
+  const normalized = value.trim().toLowerCase();
+  if (["true", "yes", "on", "1"].includes(normalized)) return true;
+  if (["false", "no", "off", "0"].includes(normalized)) return false;
+  return undefined;
+}
+
+function parseSimpleFrontmatter(content: string): { attributes: Record<string, string>; body: string } {
+  if (!content.startsWith("---\n")) {
+    return { attributes: {}, body: content };
+  }
+
+  const end = content.indexOf("\n---\n", 4);
+  if (end === -1) {
+    return { attributes: {}, body: content };
+  }
+
+  const raw = content.slice(4, end).split("\n");
+  const attributes: Record<string, string> = {};
+  for (const line of raw) {
+    const separator = line.indexOf(":");
+    if (separator === -1) continue;
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (key) attributes[key] = value;
+  }
+
+  return {
+    attributes,
+    body: content.slice(end + 5),
+  };
+}
+
+function slugifyFileStem(value: string): string {
+  const slug = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug || "memory";
+}
+
+function normalizeMemoryBodyForDedupe(text: string): string {
+  return parseSimpleFrontmatter(text).body
+    .replace(/[`*_#>-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function findSimilarMemoryNote(existingFiles: MemoryFile[], text: string): MemoryFile | undefined {
+  const target = normalizeMemoryBodyForDedupe(text);
+  if (!target) return undefined;
+
+  return existingFiles.find((file) => normalizeMemoryBodyForDedupe(file.content) === target);
+}
+
+function getPinnedStateForFile(file: MemoryFile, pinnedPaths: string[]): boolean {
+  if (pinnedPaths.includes(file.path)) return true;
+  const mainRelative = file.path.startsWith("main/") ? file.path.slice(5) : file.path;
+  if (pinnedPaths.includes(mainRelative)) return true;
+  const parsed = parseSimpleFrontmatter(file.content);
+  return parseBooleanLike(parsed.attributes.pinned ?? "") === true;
+}
+
+function countPinnedFiles(files: MemoryFile[], pinnedPaths: string[]): number {
+  return files.filter((file) => getPinnedStateForFile(file, pinnedPaths)).length;
+}
+
+function countToolManagedFiles(files: MemoryFile[]): number {
+  return files.filter((file) => {
+    return isToolManagedMemoryFile(file);
+  }).length;
+}
+
+function isToolManagedMemoryFile(file: Pick<MemoryFile, "content">): boolean {
+  const parsed = parseSimpleFrontmatter(file.content);
+  return LEGACY_MANAGED_BY_MARKERS.has(parsed.attributes.managed_by ?? "");
+}
+
+function toolDisplayPath(datasetKey: DatasetKey, path: string): string {
+  if (datasetKey === "memory" && path.startsWith("main/")) {
+    return path.slice(5);
+  }
+  return path;
+}
+
+function summarizeMemorySearchText(text: string, maxChars = 280): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}...`;
+}
+
+function retainedLibraryVirtualPath(assetId: string, title: string): string {
+  return `retained/${assetId}/${slugifyFileStem(title)}.md`;
+}
+
+function retainedLibraryStoragePath(assetId: string, title: string): string {
+  return join(LIBRARY_ASSET_BLOBS_DIR, `${assetId}-${slugifyFileStem(title)}.md`);
+}
+
+function inferTitleFromPathOrContent(pathInput: string, content: string): string {
+  const stem = basename(pathInput).replace(/\.md$/i, "").trim();
+  if (stem.length > 0) {
+    return stem;
+  }
+  const firstLine = content.split(/\r?\n/, 1)[0]?.replace(/^#+\s*/, "").trim();
+  return firstLine || "library-import";
+}
+
+function retainedAssetExists(asset: RetainedLibraryAsset): boolean {
+  return typeof asset.assetId === "string" &&
+    typeof asset.title === "string" &&
+    typeof asset.importedAt === "string" &&
+    typeof asset.contentHash === "string" &&
+    typeof asset.storagePath === "string" &&
+    typeof asset.virtualPath === "string";
+}
+
+function inferLifecycleForPath(
+  datasetKey: DatasetKey,
+  path: string,
+  compactionManifest?: CompactionManifest,
+): "mirror" | "retained" | "compacted" {
+  if (datasetKey === "library" && path.startsWith("retained/")) {
+    return "retained";
+  }
+  if (
+    datasetKey === "memory" &&
+    compactionManifest?.artifacts.some((artifact) => artifact.replacementPath === path)
+  ) {
+    return "compacted";
+  }
+  return "mirror";
+}
+
+function compactionArtifactExists(asset: CompactionArtifact): boolean {
+  return typeof asset.artifactId === "string" &&
+    typeof asset.sourcePath === "string" &&
+    typeof asset.sourceHash === "string" &&
+    typeof asset.createdAt === "string" &&
+    typeof asset.replacementPath === "string" &&
+    asset.replacementKind === "distilled-memory" &&
+    (asset.summaryMode === undefined ||
+      asset.summaryMode === "llm-distilled" ||
+      asset.summaryMode === "preserved-copy") &&
+    (asset.status === "ready" || asset.status === "applied");
+}
+
+function buildPreservedCompactionBody(file: MemoryFile): string {
+  const parsed = parseSimpleFrontmatter(file.content);
+  return parsed.body.trim() || file.content.trim();
+}
+
+function buildCompactedMemoryContent(params: {
+  file: MemoryFile;
+  body: string;
+  title?: string;
+  summaryMode: "llm-distilled" | "preserved-copy";
+  summaryModelRef?: string;
+  fallbackReason?: string;
+}): string {
+  const file = params.file;
+  const parsed = parseSimpleFrontmatter(file.content);
+  const resolvedTitle =
+    params.title?.trim() ||
+    parsed.attributes.title ||
+    inferTitleFromPathOrContent(file.path, params.body);
+  return [
+    `# Durable Memory: ${resolvedTitle}`,
+    "",
+    `Source path: ${file.path}`,
+    `Compacted at: ${new Date().toISOString()}`,
+    `Summary mode: ${params.summaryMode}`,
+    ...(params.summaryModelRef ? [`Summary model: ${params.summaryModelRef}`] : []),
+    ...(params.fallbackReason ? [`Fallback reason: ${params.fallbackReason}`] : []),
+    "",
+    "## Distilled Memory",
+    "",
+    params.body.trim(),
+    "",
+  ].join("\n");
+}
+
+function computeCompactSuggestions(
+  files: MemoryFile[],
+  manifest: CompactionManifest,
+  now = Date.now(),
+): CompactSuggestion[] {
+  const compacted = new Map(
+    manifest.artifacts.map((artifact) => [`${artifact.sourcePath}:${artifact.sourceHash}`, artifact]),
+  );
+
+  return files
+    .filter((file) => !isToolManagedMemoryFile(file))
+    .filter((file) => file.path !== "main/MEMORY.md")
+    .filter((file) => !compacted.has(`${file.path}:${file.hash}`))
+    .map((file) => {
+      const lowerPath = file.path.toLowerCase();
+      const ageDays = (now - file.mtimeMs) / 86_400_000;
+      let reason = "";
+      if (lowerPath.includes("/daily/") || /\/\d{4}-\d{2}-\d{2}[^/]*\.md$/i.test(lowerPath)) {
+        if (ageDays >= 3) {
+          reason = "dated/daily note older than 3 days";
+        }
+      } else if (ageDays >= 30) {
+        reason = "stale raw note older than 30 days";
+      }
+      return { path: file.path, reason };
+    })
+    .filter((item) => item.reason.length > 0)
+    .sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function resolveCompatibleLookupPaths(datasetKey: DatasetKey, requestedPath: string): string[] {
+  const normalized = normalizeDatasetPath(requestedPath);
+  const candidates = new Set<string>([normalized]);
+
+  if (datasetKey === "memory" && !normalized.startsWith("main/") && !normalized.startsWith("agents/")) {
+    if (normalized === "MEMORY.md" || normalized.startsWith("memory/")) {
+      candidates.add(`main/${normalized}`);
+    }
+  }
+
+  return [...candidates];
+}
+
+function findRetainedAsset(
+  manifest: RetainedLibraryManifest,
+  selector: string,
+): RetainedLibraryAsset | undefined {
+  const normalized = normalizeDatasetPath(selector);
+  return manifest.assets.find((asset) =>
+    asset.assetId === selector ||
+    asset.virtualPath === normalized ||
+    asset.storagePath === selector ||
+    asset.originalPath === selector
+  );
+}
+
+function findCompactionArtifact(
+  manifest: CompactionManifest,
+  selector: string,
+): CompactionArtifact | undefined {
+  const requested = resolveCompatibleLookupPaths("memory", selector);
+  return manifest.artifacts.find((artifact) =>
+    artifact.artifactId === selector ||
+    requested.includes(artifact.sourcePath) ||
+    requested.includes(artifact.replacementPath)
+  );
 }
 
 function resolveDatasetKey(input?: string): DatasetKey {
@@ -334,6 +805,14 @@ function resolveConfig(rawConfig: unknown): ResolvedCogneePluginConfig {
   const legacyAutoIndex = typeof raw.autoIndex === "boolean" ? raw.autoIndex : undefined;
   const legacyAutoCognify = typeof raw.autoCognify === "boolean" ? raw.autoCognify : undefined;
   const legacyAutoRecall = typeof raw.autoRecall === "boolean" ? raw.autoRecall : undefined;
+  const pinnedPaths =
+    Array.isArray(raw.pinnedPaths)
+      ? raw.pinnedPaths.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      : [];
+  const pinnedMaxResults =
+    typeof raw.pinnedMaxResults === "number" ? raw.pinnedMaxResults : DEFAULT_PINNED_MAX_RESULTS;
+  const memoryStoreMaxChars =
+    typeof raw.memoryStoreMaxChars === "number" ? raw.memoryStoreMaxChars : DEFAULT_MEMORY_STORE_MAX_CHARS;
 
   const memoryRaw = raw.datasets?.memory ?? {};
   const libraryRaw = raw.datasets?.library ?? {};
@@ -355,6 +834,13 @@ function resolveConfig(rawConfig: unknown): ResolvedCogneePluginConfig {
       typeof raw.ingestionTimeoutMs === "number"
         ? raw.ingestionTimeoutMs
         : DEFAULT_INGESTION_TIMEOUT_MS,
+    pinnedPaths,
+    pinnedMaxResults,
+    memoryStoreMaxChars,
+    summaryModel: typeof raw.summaryModel === "string" ? raw.summaryModel.trim() : "",
+    summaryProvider: typeof raw.summaryProvider === "string" ? raw.summaryProvider.trim() : "",
+    summaryMaxTokens:
+      typeof raw.summaryMaxTokens === "number" ? raw.summaryMaxTokens : DEFAULT_SUMMARY_MAX_TOKENS,
     datasets: {
       memory: {
         datasetName:
@@ -465,6 +951,208 @@ async function saveRankingState(datasetKey: DatasetKey, state: RankingState): Pr
   const path = datasetRankingPath(datasetKey);
   await fs.mkdir(dirname(path), { recursive: true });
   await fs.writeFile(path, JSON.stringify(state, null, 2), "utf-8");
+}
+
+async function loadRetainedLibraryManifest(): Promise<RetainedLibraryManifest> {
+  const manifest = await readJsonFile<RetainedLibraryManifest>(LIBRARY_ASSET_MANIFEST_PATH, { assets: [] });
+  manifest.assets = Array.isArray(manifest.assets) ? manifest.assets.filter(retainedAssetExists) : [];
+  return manifest;
+}
+
+async function saveRetainedLibraryManifest(manifest: RetainedLibraryManifest): Promise<void> {
+  await fs.mkdir(dirname(LIBRARY_ASSET_MANIFEST_PATH), { recursive: true });
+  await fs.writeFile(LIBRARY_ASSET_MANIFEST_PATH, JSON.stringify(manifest, null, 2), "utf-8");
+}
+
+async function loadCompactionManifest(): Promise<CompactionManifest> {
+  const manifest = await readJsonFile<CompactionManifest>(COMPACTION_MANIFEST_PATH, { artifacts: [] });
+  manifest.artifacts = Array.isArray(manifest.artifacts) ? manifest.artifacts.filter(compactionArtifactExists) : [];
+  return manifest;
+}
+
+async function saveCompactionManifest(manifest: CompactionManifest): Promise<void> {
+  await fs.mkdir(dirname(COMPACTION_MANIFEST_PATH), { recursive: true });
+  await fs.writeFile(COMPACTION_MANIFEST_PATH, JSON.stringify(manifest, null, 2), "utf-8");
+}
+
+function extractCompletionText(result: unknown): string {
+  if (!isRecord(result)) {
+    return "";
+  }
+  const content = result.content;
+  if (typeof content === "string") {
+    return content.trim();
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .map((entry) => {
+      if (typeof entry === "string") {
+        return entry;
+      }
+      if (isRecord(entry) && entry.type === "text" && typeof entry.text === "string") {
+        return entry.text;
+      }
+      return "";
+    })
+    .join("\n")
+    .trim();
+}
+
+async function distillMemoryFile(params: {
+  api: OpenClawPluginApi;
+  cfg: ResolvedCogneePluginConfig;
+  file: MemoryFile;
+  title?: string;
+}): Promise<DistilledSummaryResult> {
+  const fallbackBody = [
+    "### Durable Facts",
+    "",
+    buildPreservedCompactionBody(params.file),
+  ].join("\n");
+  const fallback = (reason: string): DistilledSummaryResult => ({
+    body: fallbackBody,
+    summaryMode: "preserved-copy",
+    fallbackReason: reason,
+  });
+
+  let runtimeConfig: unknown;
+  try {
+    runtimeConfig = params.api.runtime.config.loadConfig();
+  } catch {
+    runtimeConfig = params.api.config;
+  }
+
+  const selection = resolveSummaryModelSelection(
+    {
+      summaryModel: params.cfg.summaryModel,
+      summaryProvider: params.cfg.summaryProvider,
+    },
+    runtimeConfig ?? params.api.config,
+  );
+  if (!selection) {
+    return fallback("No summary model/provider could be resolved from plugin or OpenClaw config");
+  }
+
+  try {
+    const mod = (await import("@mariozechner/pi-ai") as unknown) as {
+      completeSimple?: (
+        model: Record<string, unknown>,
+        prompt: {
+          systemPrompt?: string;
+          messages: Array<{ role: string; content: string; timestamp: number }>;
+        },
+        options: { apiKey?: string; maxTokens: number },
+      ) => Promise<unknown>;
+      getModel?: (provider: string, model: string) => Record<string, unknown> | undefined;
+      getEnvApiKey?: (provider: string) => string | undefined;
+    };
+
+    if (typeof mod.completeSimple !== "function") {
+      return fallback("pi-ai completeSimple is unavailable");
+    }
+
+    const providers = isRecord(runtimeConfig) && isRecord(runtimeConfig.models) && isRecord(runtimeConfig.models.providers)
+      ? (runtimeConfig.models.providers as Record<string, unknown>)
+      : undefined;
+    const providerConfig = findProviderConfigValue(providers, selection.provider);
+    const providerRecord = isRecord(providerConfig) ? providerConfig : undefined;
+    const knownModel = typeof mod.getModel === "function"
+      ? mod.getModel(selection.provider, selection.model)
+      : undefined;
+    const knownRecord = isRecord(knownModel) ? knownModel : undefined;
+    const resolvedModel: Record<string, unknown> = {
+      id: selection.model,
+      name: selection.model,
+      provider: selection.provider,
+      api:
+        (knownRecord && typeof knownRecord.api === "string" && knownRecord.api.trim()) ||
+        (providerRecord && typeof providerRecord.api === "string" && providerRecord.api.trim()) ||
+        inferApiFromProvider(selection.provider),
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200_000,
+      maxTokens: 8_000,
+      ...(knownRecord ?? {}),
+      ...(providerRecord && typeof providerRecord.baseUrl === "string"
+        ? { baseUrl: providerRecord.baseUrl }
+        : {}),
+      ...(providerRecord && isRecord(providerRecord.headers) ? { headers: providerRecord.headers } : {}),
+    };
+
+    const modelAuth = getRuntimeModelAuth(params.api);
+    let apiKey: string | undefined;
+    if (modelAuth?.getApiKeyForModel) {
+      apiKey = resolveApiKeyFromAuthResult(
+        await modelAuth.getApiKeyForModel({
+          model: resolvedModel as RuntimeModelAuthModel,
+          cfg: params.api.config,
+        }),
+      );
+    }
+    if (!apiKey && modelAuth?.resolveApiKeyForProvider) {
+      apiKey = resolveApiKeyFromAuthResult(
+        await modelAuth.resolveApiKeyForProvider({
+          provider: selection.provider,
+          cfg: params.api.config,
+        }),
+      );
+    }
+    if (!apiKey && providerRecord && typeof providerRecord.apiKey === "string" && providerRecord.apiKey.trim()) {
+      apiKey = providerRecord.apiKey.trim();
+    }
+    if (!apiKey && typeof mod.getEnvApiKey === "function") {
+      apiKey = mod.getEnvApiKey(selection.provider)?.trim();
+    }
+
+    const title = params.title?.trim() || inferTitleFromPathOrContent(params.file.path, params.file.content);
+    const result = await mod.completeSimple(
+      resolvedModel,
+      {
+        systemPrompt: [
+          "You compact raw OpenClaw memory into durable long-term memory.",
+          "Preserve only information that should survive source-file cleanup:",
+          "- stable facts, decisions, procedures, preferences, commitments, constraints, and reusable references",
+          "- unresolved threads only when they remain actionable after the source file is gone",
+          "Drop ephemeral chatter, timestamps, and low-signal narration.",
+          'Return markdown only, with concise sections chosen from "Summary", "Durable Facts", "Procedures", "Open Threads".',
+          'If there is no durable memory, return exactly "NO_DURABLE_MEMORY".',
+        ].join("\n"),
+        messages: [
+          {
+            role: "user",
+            content: [
+              `Source path: ${params.file.path}`,
+              `Candidate title: ${title}`,
+              "",
+              "Source markdown:",
+              params.file.content.trim(),
+            ].join("\n"),
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      {
+        apiKey,
+        maxTokens: params.cfg.summaryMaxTokens,
+      },
+    );
+
+    const text = extractCompletionText(result);
+    if (!text || text === "NO_DURABLE_MEMORY") {
+      return fallback("Model returned no durable summary");
+    }
+
+    return {
+      body: text,
+      summaryMode: "llm-distilled",
+      summaryModelRef: selection.modelRef,
+    };
+  } catch (error) {
+    return fallback(error instanceof Error ? error.message : String(error));
+  }
 }
 
 function resolveUserPath(input: string, baseDir: string): string {
@@ -615,6 +1303,14 @@ async function collectLibraryDatasetFiles(
         `${source.virtualBase}/${normalizeDatasetPath(relative(source.rootPath, absPath))}`,
       )),
     );
+  }
+  const retainedManifest = await loadRetainedLibraryManifest();
+  for (const asset of retainedManifest.assets) {
+    try {
+      files.push(await readMarkdownFile(asset.storagePath, asset.virtualPath));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
   return files.sort((a, b) => a.path.localeCompare(b.path));
 }
@@ -1077,6 +1773,9 @@ function buildDatasetHealthSummary(params: {
   syncIndex: SyncIndex;
   files: MemoryFile[];
   ranking: RankingState;
+  retainedAssets?: number;
+  compactionArtifacts?: number;
+  llmCompactionArtifacts?: number;
 }): string[] {
   let dirty = 0;
   let newCount = 0;
@@ -1109,6 +1808,11 @@ function buildDatasetHealthSummary(params: {
     `Ranking recalls: ${rankingSummary.recalls}`,
     `Ranking forgets: ${rankingSummary.forgets}`,
     `Deprioritized: ${rankingSummary.deprioritized}`,
+    ...(typeof params.retainedAssets === "number" ? [`Retained assets: ${params.retainedAssets}`] : []),
+    ...(typeof params.compactionArtifacts === "number" ? [`Compaction artifacts: ${params.compactionArtifacts}`] : []),
+    ...(typeof params.llmCompactionArtifacts === "number"
+      ? [`LLM-distilled artifacts: ${params.llmCompactionArtifacts}`]
+      : []),
     `Sync index: ${datasetSyncIndexPath(params.datasetKey)}`,
   ];
 }
@@ -1147,6 +1851,83 @@ async function resolveWritableMemoryTarget(pathInput: string | undefined, worksp
     absPath: resolve(workspaceDir, normalized),
     virtualPath: `main/${normalized}`,
   };
+}
+
+async function writeManagedMemoryNote(params: {
+  workspaceDir: string;
+  text: string;
+  pinned?: boolean;
+  title?: string;
+}): Promise<{ absPath: string; virtualPath: string }> {
+  const relativeDir = join("memory", "global", TOOL_NOTE_DIRNAME);
+  const absoluteDir = resolve(params.workspaceDir, relativeDir);
+  await fs.mkdir(absoluteDir, { recursive: true });
+
+  const stem = params.title?.trim() || params.text;
+  const fileName = `${new Date().toISOString().replace(/[:.]/g, "-")}-${slugifyFileStem(stem)}.md`;
+  const absPath = join(absoluteDir, fileName);
+  const relativePath = normalizeDatasetPath(relative(params.workspaceDir, absPath));
+  const content = [
+    "---",
+    `managed_by: ${MANAGED_BY_MARKER}`,
+    `created_at: ${new Date().toISOString()}`,
+    `pinned: ${params.pinned ? "true" : "false"}`,
+    ...(params.title?.trim() ? [`title: ${params.title.trim()}`] : []),
+    "---",
+    "",
+    params.text.trim(),
+    "",
+  ].join("\n");
+  await fs.writeFile(absPath, content, "utf-8");
+  return {
+    absPath,
+    virtualPath: `main/${relativePath}`,
+  };
+}
+
+async function importRetainedLibraryAsset(params: {
+  workspaceDir: string;
+  sourcePath: string;
+  title?: string;
+}): Promise<RetainedLibraryAsset> {
+  const absSourcePath = resolveUserPath(params.sourcePath, params.workspaceDir);
+  const stat = await fs.stat(absSourcePath);
+  if (!stat.isFile()) {
+    throw new Error("library import requires a file path");
+  }
+  if (!absSourcePath.endsWith(".md")) {
+    throw new Error("library import currently supports markdown files only");
+  }
+
+  const content = await fs.readFile(absSourcePath, "utf-8");
+  const title = params.title?.trim() || inferTitleFromPathOrContent(absSourcePath, content);
+  const contentHash = hashText(content);
+  const manifest = await loadRetainedLibraryManifest();
+  const existing = manifest.assets.find((asset) => asset.contentHash === contentHash);
+  if (existing) {
+    return existing;
+  }
+
+  const assetId = `asset_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  const storagePath = retainedLibraryStoragePath(assetId, title);
+  const virtualPath = retainedLibraryVirtualPath(assetId, title);
+  const normalizedContent = content.endsWith("\n") ? content : `${content}\n`;
+
+  await fs.mkdir(dirname(storagePath), { recursive: true });
+  await fs.writeFile(storagePath, normalizedContent, "utf-8");
+
+  const asset: RetainedLibraryAsset = {
+    assetId,
+    title,
+    originalPath: absSourcePath,
+    importedAt: new Date().toISOString(),
+    contentHash,
+    storagePath,
+    virtualPath,
+  };
+  manifest.assets.push(asset);
+  await saveRetainedLibraryManifest(manifest);
+  return asset;
 }
 
 function pathInside(parent: string, child: string): boolean {
@@ -1399,18 +2180,61 @@ const memoryCogneePlugin = {
       await saveRankingState(datasetKey, ranking);
     }
 
+    async function dropIndexedPaths(datasetKey: DatasetKey, paths: string[]): Promise<void> {
+      await ensureDatasetLoaded(datasetKey);
+      const syncIndex = syncIndexes[datasetKey]!;
+      let changed = false;
+      for (const path of paths) {
+        if (syncIndex.entries[path]) {
+          delete syncIndex.entries[path];
+          changed = true;
+        }
+      }
+      if (changed) {
+        await saveDatasetSyncIndex(datasetKey, syncIndex);
+      }
+    }
+
+    async function removeRankingPaths(datasetKey: DatasetKey, paths: string[]): Promise<void> {
+      await ensureDatasetLoaded(datasetKey);
+      const ranking = rankingStates[datasetKey]!;
+      let changed = false;
+      for (const path of paths) {
+        if (ranking.entries[path]) {
+          delete ranking.entries[path];
+          changed = true;
+        }
+      }
+      if (changed) {
+        await saveRankingState(datasetKey, ranking);
+      }
+    }
+
     async function storeMemory(params: {
       datasetKey: DatasetKey;
       workspaceDir: string;
       text: string;
       path?: string;
+      title?: string;
+      pinned?: boolean;
     }): Promise<{ path: string; sync: SyncResult & { datasetId?: string } }> {
       const target =
-        params.datasetKey === "memory"
-          ? await resolveWritableMemoryTarget(params.path, params.workspaceDir)
-          : await resolveWritableLibraryTarget(params.path, params.workspaceDir, cfg.datasets.library);
-      await fs.mkdir(dirname(target.absPath), { recursive: true });
-      await fs.writeFile(target.absPath, params.text.endsWith("\n") ? params.text : `${params.text}\n`, "utf-8");
+        params.datasetKey === "memory" && !params.path
+          ? await writeManagedMemoryNote({
+              workspaceDir: params.workspaceDir,
+              text: params.text,
+              title: params.title,
+              pinned: params.pinned,
+            })
+          : params.datasetKey === "memory"
+            ? await resolveWritableMemoryTarget(params.path, params.workspaceDir)
+            : await resolveWritableLibraryTarget(params.path, params.workspaceDir, cfg.datasets.library);
+
+      if (!(params.datasetKey === "memory" && !params.path)) {
+        await fs.mkdir(dirname(target.absPath), { recursive: true });
+        await fs.writeFile(target.absPath, params.text.endsWith("\n") ? params.text : `${params.text}\n`, "utf-8");
+      }
+
       await ensureDatasetLoaded(params.datasetKey);
       const ranking = rankingStates[params.datasetKey]!;
       const signals = getSignals(ranking, normalizeDatasetPath(target.virtualPath));
@@ -1428,8 +2252,8 @@ const memoryCogneePlugin = {
     ): Promise<MemoryFile | undefined> {
       const files = await collectDatasetFiles(datasetKey, workspaceDir, cfg);
       if (params.path) {
-        const requested = normalizeDatasetPath(params.path);
-        return files.find((file) => file.path === requested);
+        const requestedPaths = resolveCompatibleLookupPaths(datasetKey, params.path);
+        return files.find((file) => requestedPaths.includes(file.path));
       }
       if (!params.query) return undefined;
       await ensureDatasetLoaded(datasetKey);
@@ -1453,7 +2277,7 @@ const memoryCogneePlugin = {
       path?: string;
       query?: string;
       mode: "delete" | "deprioritize" | "purge-critical";
-    }): Promise<{ action: string; path?: string; sync?: SyncResult & { datasetId?: string } }> {
+    }): Promise<{ action: string; path?: string; message?: string; sync?: SyncResult & { datasetId?: string } }> {
       const file = await resolveFileTarget(params.datasetKey, params.workspaceDir, {
         path: params.path,
         query: params.query,
@@ -1471,6 +2295,14 @@ const memoryCogneePlugin = {
         return { action: "deprioritized", path: file.path };
       }
 
+      if (params.mode === "delete" && !isToolManagedMemoryFile(file)) {
+        return {
+          action: "denied",
+          path: file.path,
+          message: "memory_forget delete only removes tool-managed notes; use deprioritize or purge-critical for handwritten files",
+        };
+      }
+
       await fs.unlink(file.absPath);
       delete ranking.entries[file.path];
       await saveRankingState(params.datasetKey, ranking);
@@ -1482,6 +2314,324 @@ const memoryCogneePlugin = {
 
       const sync = await syncDataset(params.datasetKey, params.workspaceDir, api.logger);
       return { action: "deleted", path: file.path, sync };
+    }
+
+    async function compactMemorySource(params: {
+      workspaceDir: string;
+      path?: string;
+      query?: string;
+      title?: string;
+      deleteSource?: boolean;
+      forceRegenerate?: boolean;
+    }): Promise<{
+      action: "compacted";
+      sourcePath: string;
+      replacementPath: string;
+      deletedSource: boolean;
+      summaryMode: "llm-distilled" | "preserved-copy";
+      summaryModelRef?: string;
+      fallbackReason?: string;
+      sync: SyncResult & { datasetId?: string };
+    }> {
+      const file = await resolveFileTarget("memory", params.workspaceDir, {
+        path: params.path,
+        query: params.query,
+      });
+      if (!file) {
+        throw new Error("No matching memory file found");
+      }
+      if (isToolManagedMemoryFile(file)) {
+        throw new Error("compact-memory is intended for handwritten or transient memory files, not existing tool-managed notes");
+      }
+
+      const manifest = await loadCompactionManifest();
+      const existing = manifest.artifacts.find((artifact) => artifact.sourcePath === file.path && artifact.sourceHash === file.hash);
+      let replacementPath = existing?.replacementPath;
+      let summaryMode = existing?.summaryMode ?? "preserved-copy";
+      let summaryModelRef = existing?.summaryModelRef;
+      let fallbackReason: string | undefined;
+
+      if (!replacementPath || params.forceRegenerate) {
+        const distilled = await distillMemoryFile({
+          api,
+          cfg,
+          file,
+          title: params.title,
+        });
+        const replacement = await writeManagedMemoryNote({
+          workspaceDir: params.workspaceDir,
+          text: buildCompactedMemoryContent({
+            file,
+            body: distilled.body,
+            title: params.title,
+            summaryMode: distilled.summaryMode,
+            summaryModelRef: distilled.summaryModelRef,
+            fallbackReason: distilled.fallbackReason,
+          }),
+          title: params.title ? `compacted-${params.title}` : `compacted-${inferTitleFromPathOrContent(file.path, file.content)}`,
+          pinned: false,
+        });
+        replacementPath = replacement.virtualPath;
+        summaryMode = distilled.summaryMode;
+        summaryModelRef = distilled.summaryModelRef;
+        fallbackReason = distilled.fallbackReason;
+        if (existing) {
+          manifest.artifacts = manifest.artifacts.filter((artifact) => artifact.artifactId !== existing.artifactId);
+        }
+        manifest.artifacts.push({
+          artifactId: `compact_${randomUUID().replace(/-/g, "").slice(0, 16)}`,
+          sourcePath: file.path,
+          sourceHash: file.hash,
+          createdAt: new Date().toISOString(),
+          replacementPath,
+          replacementKind: "distilled-memory",
+          status: params.deleteSource ? "applied" : "ready",
+          summaryMode,
+          ...(summaryModelRef ? { summaryModelRef } : {}),
+          ...(params.forceRegenerate ? { lastRebuiltAt: new Date().toISOString() } : {}),
+        });
+        await saveCompactionManifest(manifest);
+      }
+
+      let sync = await syncDataset("memory", params.workspaceDir, api.logger);
+      let deletedSource = false;
+
+      if (params.deleteSource) {
+        await fs.unlink(file.absPath);
+        deletedSource = true;
+        const manifestAfterDelete = await loadCompactionManifest();
+        const artifact = manifestAfterDelete.artifacts.find((entry) => entry.sourcePath === file.path && entry.sourceHash === file.hash);
+        if (artifact) {
+          artifact.status = "applied";
+          await saveCompactionManifest(manifestAfterDelete);
+        }
+        sync = await syncDataset("memory", params.workspaceDir, api.logger);
+      }
+
+      return {
+        action: "compacted",
+        sourcePath: file.path,
+        replacementPath,
+        deletedSource,
+        summaryMode,
+        summaryModelRef,
+        fallbackReason,
+        sync,
+      };
+    }
+
+    async function auditRetainedAssets(): Promise<Array<{
+      assetId: string;
+      title: string;
+      virtualPath: string;
+      storagePath: string;
+      indexed: boolean;
+      storageExists: boolean;
+      originalPath?: string;
+    }>> {
+      await ensureDatasetLoaded("library");
+      const manifest = await loadRetainedLibraryManifest();
+      return Promise.all(manifest.assets.map(async (asset) => {
+        let storageExists = true;
+        try {
+          await fs.access(asset.storagePath);
+        } catch {
+          storageExists = false;
+        }
+        return {
+          assetId: asset.assetId,
+          title: asset.title,
+          virtualPath: asset.virtualPath,
+          storagePath: asset.storagePath,
+          indexed: !!syncIndexes.library?.entries[asset.virtualPath],
+          storageExists,
+          originalPath: asset.originalPath,
+        };
+      }));
+    }
+
+    async function auditCompactionArtifacts(workspaceDir: string): Promise<Array<{
+      artifactId: string;
+      sourcePath: string;
+      replacementPath: string;
+      status: "ready" | "applied";
+      summaryMode: "llm-distilled" | "preserved-copy";
+      summaryModelRef?: string;
+      sourceExists: boolean;
+      replacementExists: boolean;
+      replacementIndexed: boolean;
+    }>> {
+      await ensureDatasetLoaded("memory");
+      const manifest = await loadCompactionManifest();
+      const files = await collectDatasetFiles("memory", workspaceDir, cfg);
+      const livePaths = new Set(files.map((file) => file.path));
+      return manifest.artifacts.map((artifact) => ({
+        artifactId: artifact.artifactId,
+        sourcePath: artifact.sourcePath,
+        replacementPath: artifact.replacementPath,
+        status: artifact.status,
+        summaryMode: artifact.summaryMode ?? "preserved-copy",
+        summaryModelRef: artifact.summaryModelRef,
+        sourceExists: livePaths.has(artifact.sourcePath),
+        replacementExists: livePaths.has(artifact.replacementPath),
+        replacementIndexed: !!syncIndexes.memory?.entries[artifact.replacementPath],
+      }));
+    }
+
+    async function deleteRetainedAsset(workspaceDir: string, selector: string): Promise<{
+      assetId: string;
+      virtualPath: string;
+      deletedStorage: boolean;
+      sync: SyncResult & { datasetId?: string };
+    }> {
+      const manifest = await loadRetainedLibraryManifest();
+      const asset = findRetainedAsset(manifest, selector);
+      if (!asset) {
+        throw new Error(`No retained asset found for ${selector}`);
+      }
+      let deletedStorage = false;
+      try {
+        await fs.unlink(asset.storagePath);
+        deletedStorage = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error;
+        }
+      }
+      manifest.assets = manifest.assets.filter((entry) => entry.assetId !== asset.assetId);
+      await saveRetainedLibraryManifest(manifest);
+      await removeRankingPaths("library", [asset.virtualPath]);
+      await dropIndexedPaths("library", [asset.virtualPath]);
+      const sync = await syncDataset("library", workspaceDir, api.logger);
+      return {
+        assetId: asset.assetId,
+        virtualPath: asset.virtualPath,
+        deletedStorage,
+        sync,
+      };
+    }
+
+    async function rebuildRetainedAsset(workspaceDir: string, selector: string): Promise<{
+      assetId: string;
+      virtualPath: string;
+      sync: SyncResult & { datasetId?: string };
+    }> {
+      const manifest = await loadRetainedLibraryManifest();
+      const asset = findRetainedAsset(manifest, selector);
+      if (!asset) {
+        throw new Error(`No retained asset found for ${selector}`);
+      }
+      try {
+        await fs.access(asset.storagePath);
+      } catch {
+        throw new Error(`Retained asset storage is missing: ${asset.storagePath}`);
+      }
+      await dropIndexedPaths("library", [asset.virtualPath]);
+      const sync = await syncDataset("library", workspaceDir, api.logger);
+      return {
+        assetId: asset.assetId,
+        virtualPath: asset.virtualPath,
+        sync,
+      };
+    }
+
+    async function deleteCompactionArtifact(params: {
+      workspaceDir: string;
+      selector: string;
+      keepReplacement?: boolean;
+    }): Promise<{
+      artifactId: string;
+      replacementPath: string;
+      deletedReplacement: boolean;
+      sync: SyncResult & { datasetId?: string };
+    }> {
+      const manifest = await loadCompactionManifest();
+      const artifact = findCompactionArtifact(manifest, params.selector);
+      if (!artifact) {
+        throw new Error(`No compaction artifact found for ${params.selector}`);
+      }
+
+      let deletedReplacement = false;
+      if (!params.keepReplacement) {
+        const replacement = await resolveFileTarget("memory", params.workspaceDir, { path: artifact.replacementPath });
+        if (replacement && isToolManagedMemoryFile(replacement)) {
+          await fs.unlink(replacement.absPath);
+          deletedReplacement = true;
+        }
+      }
+
+      manifest.artifacts = manifest.artifacts.filter((entry) => entry.artifactId !== artifact.artifactId);
+      await saveCompactionManifest(manifest);
+      await removeRankingPaths("memory", [artifact.replacementPath]);
+      await dropIndexedPaths("memory", [artifact.replacementPath]);
+      const sync = await syncDataset("memory", params.workspaceDir, api.logger);
+      return {
+        artifactId: artifact.artifactId,
+        replacementPath: artifact.replacementPath,
+        deletedReplacement,
+        sync,
+      };
+    }
+
+    async function rebuildCompactionArtifact(params: {
+      workspaceDir: string;
+      selector: string;
+      title?: string;
+      deleteSource?: boolean;
+    }): Promise<{
+      artifactId: string;
+      mode: "reindexed" | "regenerated";
+      replacementPath: string;
+      sync: SyncResult & { datasetId?: string };
+      summaryMode?: "llm-distilled" | "preserved-copy";
+      summaryModelRef?: string;
+      fallbackReason?: string;
+    }> {
+      const manifest = await loadCompactionManifest();
+      const artifact = findCompactionArtifact(manifest, params.selector);
+      if (!artifact) {
+        throw new Error(`No compaction artifact found for ${params.selector}`);
+      }
+
+      const source = await resolveFileTarget("memory", params.workspaceDir, { path: artifact.sourcePath });
+      if (!source) {
+        await dropIndexedPaths("memory", [artifact.replacementPath]);
+        const sync = await syncDataset("memory", params.workspaceDir, api.logger);
+        return {
+          artifactId: artifact.artifactId,
+          mode: "reindexed",
+          replacementPath: artifact.replacementPath,
+          sync,
+          summaryMode: artifact.summaryMode,
+          summaryModelRef: artifact.summaryModelRef,
+        };
+      }
+
+      const replacement = await resolveFileTarget("memory", params.workspaceDir, { path: artifact.replacementPath });
+      if (replacement && isToolManagedMemoryFile(replacement)) {
+        await fs.unlink(replacement.absPath);
+      }
+      manifest.artifacts = manifest.artifacts.filter((entry) => entry.artifactId !== artifact.artifactId);
+      await saveCompactionManifest(manifest);
+      await removeRankingPaths("memory", [artifact.replacementPath]);
+      await dropIndexedPaths("memory", [artifact.replacementPath]);
+
+      const rebuilt = await compactMemorySource({
+        workspaceDir: params.workspaceDir,
+        path: artifact.sourcePath,
+        title: params.title,
+        deleteSource: params.deleteSource === true,
+        forceRegenerate: true,
+      });
+      return {
+        artifactId: artifact.artifactId,
+        mode: "regenerated",
+        replacementPath: rebuilt.replacementPath,
+        sync: rebuilt.sync,
+        summaryMode: rebuilt.summaryMode,
+        summaryModelRef: rebuilt.summaryModelRef,
+        fallbackReason: rebuilt.fallbackReason,
+      };
     }
 
     function resolveToolWorkspace(ctx: { workspaceDir?: string }): string {
@@ -1503,11 +2653,15 @@ const memoryCogneePlugin = {
                 query: { type: "string", description: "Search query" },
                 dataset: { type: "string", enum: ["memory", "library"], description: "Target dataset (default: memory)" },
                 limit: { type: "number", description: "Maximum results" },
+                scope: { type: "string", description: "Legacy compatibility field. Ignored by the dataset-based plugin." },
               },
               required: ["query"],
               additionalProperties: false,
             },
-            async execute(_toolCallId: string, params: { query: string; dataset?: string; limit?: number }) {
+            async execute(
+              _toolCallId: string,
+              params: { query: string; dataset?: string; limit?: number; scope?: string },
+            ) {
               const datasetKey = resolveDatasetKey(params.dataset);
               await ensureDatasetLoaded(datasetKey);
               const results = await searchDataset({
@@ -1527,28 +2681,97 @@ const memoryCogneePlugin = {
               }
 
               await markSearchHits(datasetKey, results);
+              const compactionManifest = datasetKey === "memory" ? await loadCompactionManifest() : undefined;
               return {
                 content: [
                   {
                     type: "text" as const,
                     text: results
                       .map(
-                        (result, index) =>
-                          `${index + 1}. ${result.path} (score=${result.adjustedScore.toFixed(3)}, base=${result.baseScore.toFixed(3)})`,
+                        (result, index) => {
+                          const displayPath = toolDisplayPath(datasetKey, result.path);
+                          const snippet = summarizeMemorySearchText(result.text);
+                          return `${index + 1}. ${displayPath} (score=${result.adjustedScore.toFixed(3)}, base=${result.baseScore.toFixed(3)})\n   ${snippet}`;
+                        },
                       )
                       .join("\n"),
                   },
                 ],
                 details: {
                   dataset: datasetKey,
-                  results: results.map((result) => ({
-                    path: result.path,
-                    adjustedScore: result.adjustedScore,
-                    baseScore: result.baseScore,
-                    signals: result.signals,
-                  })),
+                  count: results.length,
+                  scopeIgnored: typeof params.scope === "string" ? params.scope : undefined,
+                  results: results.map((result) => {
+                    const artifact =
+                      datasetKey === "memory"
+                        ? compactionManifest?.artifacts.find((entry) => entry.replacementPath === result.path)
+                        : undefined;
+                    return {
+                      path: toolDisplayPath(datasetKey, result.path),
+                      virtualPath: result.path,
+                      lifecycle: inferLifecycleForPath(datasetKey, result.path, compactionManifest),
+                      ...(artifact?.summaryMode ? { summaryMode: artifact.summaryMode } : {}),
+                      ...(artifact?.summaryModelRef ? { summaryModelRef: artifact.summaryModelRef } : {}),
+                      text: summarizeMemorySearchText(result.text, 600),
+                      adjustedScore: result.adjustedScore,
+                      baseScore: result.baseScore,
+                      signals: result.signals,
+                    };
+                  }),
                 },
               };
+            },
+          },
+          {
+            name: "memory_status",
+            label: "Memory Status",
+            description:
+              "Inspect current Cognee memory dataset state. Preserved for compatibility with older memory workflows.",
+            parameters: {
+              type: "object",
+              properties: {
+                dataset: { type: "string", enum: ["memory", "library"], description: "Target dataset (default: memory)" },
+              },
+              additionalProperties: false,
+            },
+            async execute(_toolCallId: string, params: { dataset?: string }) {
+              const datasetKey = resolveDatasetKey(params.dataset);
+              await ensureDatasetLoaded(datasetKey);
+              const files = await collectDatasetFiles(datasetKey, workspaceDir, cfg);
+              const indexedFiles = Object.keys(syncIndexes[datasetKey]!.entries).length;
+              const pinnedCount = datasetKey === "memory" ? countPinnedFiles(files, cfg.pinnedPaths) : 0;
+              const managedCount = datasetKey === "memory" ? countToolManagedFiles(files) : 0;
+              const retainedCount = datasetKey === "library" ? (await loadRetainedLibraryManifest()).assets.length : undefined;
+              const compactionManifest = datasetKey === "memory" ? await loadCompactionManifest() : undefined;
+              const compactedCount = compactionManifest?.artifacts.length;
+              const llmCompactedCount =
+                compactionManifest?.artifacts.filter((artifact) => artifact.summaryMode === "llm-distilled").length;
+              const lines = [
+                `Dataset: ${cfg.datasets[datasetKey].datasetName}`,
+                `Dataset key: ${datasetKey}`,
+                `Dataset ID: ${datasetIds[datasetKey] ?? syncIndexes[datasetKey]!.datasetId ?? "(not set)"}`,
+                `Indexed files: ${indexedFiles}`,
+                `Workspace files: ${files.length}`,
+                `Pinned paths: ${cfg.pinnedPaths.length}`,
+                `Pinned files: ${pinnedCount}`,
+                `Tool-managed files: ${managedCount}`,
+                ...(typeof retainedCount === "number" ? [`Retained assets: ${retainedCount}`] : []),
+                ...(typeof compactedCount === "number" ? [`Compaction artifacts: ${compactedCount}`] : []),
+                ...(typeof llmCompactedCount === "number" ? [`LLM-distilled artifacts: ${llmCompactedCount}`] : []),
+              ];
+              return renderToolText(lines, {
+                dataset: datasetKey,
+                datasetId: datasetIds[datasetKey] ?? syncIndexes[datasetKey]!.datasetId,
+                indexedFiles,
+                workspaceFiles: files.length,
+                pinnedPaths: cfg.pinnedPaths,
+                pinnedMaxResults: cfg.pinnedMaxResults,
+                pinnedFiles: pinnedCount,
+                toolManagedFiles: managedCount,
+                ...(typeof retainedCount === "number" ? { retainedAssets: retainedCount } : {}),
+                ...(typeof compactedCount === "number" ? { compactionArtifacts: compactedCount } : {}),
+                ...(typeof llmCompactedCount === "number" ? { llmDistilledArtifacts: llmCompactedCount } : {}),
+              });
             },
           },
           {
@@ -1572,9 +2795,22 @@ const memoryCogneePlugin = {
                 return renderToolText([`No file found in dataset "${datasetKey}".`]);
               }
               await markRecall(datasetKey, file.path);
+              const compactionManifest = datasetKey === "memory" ? await loadCompactionManifest() : undefined;
+              const artifact =
+                datasetKey === "memory"
+                  ? compactionManifest?.artifacts.find((entry) => entry.replacementPath === file.path)
+                  : undefined;
               return {
                 content: [{ type: "text" as const, text: file.content }],
-                details: { dataset: datasetKey, path: file.path, absPath: file.absPath },
+                details: {
+                  dataset: datasetKey,
+                  path: toolDisplayPath(datasetKey, file.path),
+                  virtualPath: file.path,
+                  lifecycle: inferLifecycleForPath(datasetKey, file.path, compactionManifest),
+                  ...(artifact?.summaryMode ? { summaryMode: artifact.summaryMode } : {}),
+                  ...(artifact?.summaryModelRef ? { summaryModelRef: artifact.summaryModelRef } : {}),
+                  absPath: file.absPath,
+                },
               };
             },
           },
@@ -1589,21 +2825,59 @@ const memoryCogneePlugin = {
                 text: { type: "string", description: "Markdown content to store" },
                 path: { type: "string", description: "Optional target path. memory writes default to main/memory/*.md; library writes require an explicit configured path." },
                 dataset: { type: "string", enum: ["memory", "library"], description: "Target dataset (default: memory)" },
+                title: { type: "string", description: "Legacy compatibility field for tool-managed memory note title." },
+                pinned: { type: "boolean", description: "Legacy compatibility field for tool-managed pinned memory notes." },
+                scope: { type: "string", description: "Legacy compatibility field. Ignored by the dataset-based plugin." },
               },
               required: ["text"],
               additionalProperties: false,
             },
-            async execute(_toolCallId: string, params: { text: string; path?: string; dataset?: string }) {
+            async execute(
+              _toolCallId: string,
+              params: { text: string; path?: string; dataset?: string; title?: string; pinned?: boolean; scope?: string },
+            ) {
               const datasetKey = resolveDatasetKey(params.dataset);
+              if (params.text.trim().length > cfg.memoryStoreMaxChars) {
+                return renderToolText(
+                  [`Memory text exceeds ${cfg.memoryStoreMaxChars} characters.`],
+                  { action: "invalid" },
+                );
+              }
+
+              if (datasetKey === "memory") {
+                const existingFiles = await collectDatasetFiles("memory", workspaceDir, cfg);
+                const similar = findSimilarMemoryNote(existingFiles, params.text);
+                if (similar) {
+                  return renderToolText(
+                    [`Similar memory note already exists at ${toolDisplayPath("memory", similar.path)}`],
+                    {
+                      action: "duplicate",
+                      existingPath: toolDisplayPath("memory", similar.path),
+                      virtualPath: similar.path,
+                    },
+                  );
+                }
+              }
+
               const stored = await storeMemory({
                 datasetKey,
                 workspaceDir,
                 text: params.text,
                 path: params.path,
+                title: params.title,
+                pinned: params.pinned,
               });
               return {
-                content: [{ type: "text" as const, text: `Stored ${stored.path} in dataset "${datasetKey}".` }],
-                details: { dataset: datasetKey, path: stored.path, sync: stored.sync },
+                content: [{ type: "text" as const, text: `Stored ${toolDisplayPath(datasetKey, stored.path)} in dataset "${datasetKey}".` }],
+                details: {
+                  dataset: datasetKey,
+                  path: toolDisplayPath(datasetKey, stored.path),
+                  virtualPath: stored.path,
+                  title: params.title,
+                  pinned: params.pinned ?? false,
+                  scopeIgnored: typeof params.scope === "string" ? params.scope : undefined,
+                  sync: stored.sync,
+                },
               };
             },
           },
@@ -1611,7 +2885,7 @@ const memoryCogneePlugin = {
             name: "memory_forget",
             label: "Memory Forget",
             description:
-              "Forget a memory file by deleting it, deprioritizing it, or purging it critically. Default dataset is memory.",
+              "Forget a memory file by safely deleting a tool-managed note, deprioritizing it, or purging it critically. Default dataset is memory.",
             parameters: {
               type: "object",
               properties: {
@@ -1639,14 +2913,14 @@ const memoryCogneePlugin = {
                 mode: params.mode ?? "delete",
               });
               return {
-                content: [{ type: "text" as const, text: `${result.action}: ${result.path ?? "(unknown)"}` }],
+                content: [{ type: "text" as const, text: result.message ?? `${result.action}: ${result.path ?? "(unknown)"}` }],
                 details: { dataset: datasetKey, ...result },
               };
             },
           },
         ];
       },
-      { names: ["memory_search", "memory_get", "memory_store", "memory_forget"] },
+      { names: ["memory_search", "memory_status", "memory_get", "memory_store", "memory_forget"] },
     );
 
     api.registerCli((ctx) => {
@@ -1673,6 +2947,11 @@ const memoryCogneePlugin = {
           const datasetKey = resolveDatasetKey(opts.dataset);
           await ensureDatasetLoaded(datasetKey);
           const files = await collectDatasetFiles(datasetKey, workspaceDir, cfg);
+          const retainedAssets = datasetKey === "library" ? (await loadRetainedLibraryManifest()).assets.length : undefined;
+          const compactionManifest = datasetKey === "memory" ? await loadCompactionManifest() : undefined;
+          const compactionArtifacts = compactionManifest?.artifacts.length;
+          const llmCompactionArtifacts =
+            compactionManifest?.artifacts.filter((artifact) => artifact.summaryMode === "llm-distilled").length;
           const lines = buildDatasetHealthSummary({
             datasetKey,
             datasetName: cfg.datasets[datasetKey].datasetName,
@@ -1680,6 +2959,9 @@ const memoryCogneePlugin = {
             syncIndex: syncIndexes[datasetKey]!,
             files,
             ranking: rankingStates[datasetKey]!,
+            retainedAssets,
+            compactionArtifacts,
+            llmCompactionArtifacts,
           });
           console.log(lines.join("\n"));
         });
@@ -1731,6 +3013,79 @@ const memoryCogneePlugin = {
         });
 
       cognee
+        .command("import-library")
+        .description("Import a markdown file into retained library storage so it survives source-file cleanup")
+        .argument("<path>", "Path to a markdown file")
+        .option("--title <title>", "Optional retained asset title")
+        .action(async (path: string, opts: { title?: string }) => {
+          const asset = await importRetainedLibraryAsset({
+            workspaceDir,
+            sourcePath: path,
+            title: opts.title,
+          });
+          const result = await syncDataset("library", workspaceDir, ctx.logger);
+          console.log(
+            `[library] imported ${asset.virtualPath} (${result.added} added, ${result.updated} updated, ${result.deleted} deleted, ${result.errors} errors)`,
+          );
+        });
+
+      cognee
+        .command("assets-audit")
+        .description("Audit retained library assets and compacted memory artifacts")
+        .option("--dataset <dataset>", "Target lifecycle inventory (memory|library|all)", "all")
+        .action(async (opts: { dataset?: string }) => {
+          const target = (opts.dataset ?? "all").trim().toLowerCase();
+          if (target === "all" || target === "library") {
+            const retained = await auditRetainedAssets();
+            console.log("[library] retained assets");
+            if (retained.length === 0) {
+              console.log("  (none)");
+            } else {
+              for (const asset of retained) {
+                console.log(
+                  `${asset.assetId}\t${asset.virtualPath}\tstorage=${asset.storageExists ? "ok" : "missing"}\tindexed=${asset.indexed ? "yes" : "no"}`,
+                );
+              }
+            }
+          }
+          if (target === "all" || target === "memory") {
+            const artifacts = await auditCompactionArtifacts(workspaceDir);
+            console.log("[memory] compaction artifacts");
+            if (artifacts.length === 0) {
+              console.log("  (none)");
+            } else {
+              for (const artifact of artifacts) {
+                console.log(
+                  `${artifact.artifactId}\t${artifact.sourcePath}\t->\t${artifact.replacementPath}\tmode=${artifact.summaryMode}\tstatus=${artifact.status}\treplacement=${artifact.replacementExists ? "ok" : "missing"}\tindexed=${artifact.replacementIndexed ? "yes" : "no"}`,
+                );
+              }
+            }
+          }
+        });
+
+      cognee
+        .command("retained-delete")
+        .description("Delete a retained library asset from plugin-managed storage and resync library")
+        .argument("<selector>", "Asset id, virtual path, storage path, or original path")
+        .action(async (selector: string) => {
+          const result = await deleteRetainedAsset(workspaceDir, selector);
+          console.log(
+            `[library] deleted retained asset ${result.assetId} (${result.virtualPath})${result.deletedStorage ? "" : " (storage already missing)"}`,
+          );
+        });
+
+      cognee
+        .command("retained-rebuild")
+        .description("Force a retained library asset to be reindexed from plugin-managed storage")
+        .argument("<selector>", "Asset id, virtual path, storage path, or original path")
+        .action(async (selector: string) => {
+          const result = await rebuildRetainedAsset(workspaceDir, selector);
+          console.log(
+            `[library] rebuilt retained asset ${result.assetId} (${result.virtualPath}); ${result.sync.added} added, ${result.sync.updated} updated, ${result.sync.deleted} deleted`,
+          );
+        });
+
+      cognee
         .command("stats")
         .description("Inspect ranking stats for a dataset")
         .option("--dataset <dataset>", "Target dataset (memory|library)", "memory")
@@ -1739,6 +3094,7 @@ const memoryCogneePlugin = {
           const datasetKey = resolveDatasetKey(opts.dataset);
           await ensureDatasetLoaded(datasetKey);
           const files = await collectDatasetFiles(datasetKey, workspaceDir, cfg);
+          const compactionManifest = datasetKey === "memory" ? await loadCompactionManifest() : undefined;
           const top = Number.parseInt(opts.top ?? "10", 10);
           const rows = files
             .map((file) => ({
@@ -1754,7 +3110,7 @@ const memoryCogneePlugin = {
             .slice(0, top);
           for (const row of rows) {
             console.log(
-              `${row.path}\tscore=${row.adjustedScore.toFixed(3)}\thits=${row.signals.searchHitCount}\trecalls=${row.signals.recallCount}\tforgets=${row.signals.forgetCount}`,
+              `${row.path}\tlifecycle=${inferLifecycleForPath(datasetKey, row.path, compactionManifest)}\tscore=${row.adjustedScore.toFixed(3)}\thits=${row.signals.searchHitCount}\trecalls=${row.signals.recallCount}\tforgets=${row.signals.forgetCount}`,
             );
           }
         });
@@ -1786,6 +3142,131 @@ const memoryCogneePlugin = {
             mode: "purge-critical",
           });
           console.log(`[${datasetKey}] ${result.action} ${result.path}`);
+        });
+
+      cognee
+        .command("compact-memory")
+        .description("Create a durable tool-managed memory artifact from a raw memory file before optional source cleanup")
+        .argument("<path>", "Memory path to compact")
+        .option("--title <title>", "Optional durable artifact title")
+        .option("--delete-source", "Delete the source file after the durable artifact is synced", false)
+        .action(async (path: string, opts: { title?: string; deleteSource?: boolean }) => {
+          const result = await compactMemorySource({
+            workspaceDir,
+            path: normalizeDatasetPath(path),
+            title: opts.title,
+            deleteSource: opts.deleteSource === true,
+          });
+          console.log(
+            `[memory] compacted ${result.sourcePath} -> ${toolDisplayPath("memory", result.replacementPath)} [${result.summaryMode}${result.summaryModelRef ? ` via ${result.summaryModelRef}` : ""}]${result.deletedSource ? " (source deleted)" : ""}${result.fallbackReason ? ` [fallback: ${result.fallbackReason}]` : ""}`,
+          );
+        });
+
+      cognee
+        .command("compact-suggest")
+        .description("Suggest raw memory files that should be compacted into durable artifacts")
+        .option("--limit <n>", "Maximum suggestions", "10")
+        .action(async (opts: { limit?: string }) => {
+          const files = await collectDatasetFiles("memory", workspaceDir, cfg);
+          const manifest = await loadCompactionManifest();
+          const suggestions = computeCompactSuggestions(files, manifest)
+            .slice(0, Number.parseInt(opts.limit ?? "10", 10));
+          if (suggestions.length === 0) {
+            console.log("[memory] no compaction suggestions");
+            return;
+          }
+          for (const suggestion of suggestions) {
+            console.log(`${toolDisplayPath("memory", suggestion.path)}\t${suggestion.reason}`);
+          }
+        });
+
+      cognee
+        .command("compact-apply")
+        .description("Apply compaction to suggested raw memory files")
+        .option("--limit <n>", "How many suggestions to apply", "5")
+        .option("--delete-source", "Delete each source file after its durable artifact is synced", false)
+        .action(async (opts: { limit?: string; deleteSource?: boolean }) => {
+          const files = await collectDatasetFiles("memory", workspaceDir, cfg);
+          const manifest = await loadCompactionManifest();
+          const suggestions = computeCompactSuggestions(files, manifest)
+            .slice(0, Number.parseInt(opts.limit ?? "5", 10));
+          if (suggestions.length === 0) {
+            console.log("[memory] no compaction suggestions to apply");
+            return;
+          }
+
+          let applied = 0;
+          let failed = 0;
+          for (const suggestion of suggestions) {
+            try {
+              const result = await compactMemorySource({
+                workspaceDir,
+                path: suggestion.path,
+                deleteSource: opts.deleteSource === true,
+              });
+              console.log(
+                `[memory] compacted ${toolDisplayPath("memory", result.sourcePath)} -> ${toolDisplayPath("memory", result.replacementPath)} [${result.summaryMode}${result.summaryModelRef ? ` via ${result.summaryModelRef}` : ""}]${result.deletedSource ? " (source deleted)" : ""}${result.fallbackReason ? ` [fallback: ${result.fallbackReason}]` : ""}`,
+              );
+              applied += 1;
+            } catch (error) {
+              console.log(
+                `[memory] failed to compact ${toolDisplayPath("memory", suggestion.path)}: ${error instanceof Error ? error.message : String(error)}`,
+              );
+              failed += 1;
+            }
+          }
+
+          console.log(`[memory] compact-apply complete: ${applied} applied, ${failed} failed`);
+        });
+
+      cognee
+        .command("compaction-audit")
+        .description("Audit compaction artifacts and their replacement-note/index state")
+        .action(async () => {
+          const artifacts = await auditCompactionArtifacts(workspaceDir);
+          if (artifacts.length === 0) {
+            console.log("[memory] no compaction artifacts");
+            return;
+          }
+          for (const artifact of artifacts) {
+            console.log(
+              `${artifact.artifactId}\t${artifact.sourcePath}\t->\t${artifact.replacementPath}\tmode=${artifact.summaryMode}\tstatus=${artifact.status}\tsource=${artifact.sourceExists ? "present" : "missing"}\treplacement=${artifact.replacementExists ? "present" : "missing"}\tindexed=${artifact.replacementIndexed ? "yes" : "no"}`,
+            );
+          }
+        });
+
+      cognee
+        .command("compaction-delete")
+        .description("Delete a compaction artifact record and optionally keep its replacement note")
+        .argument("<selector>", "Artifact id, source path, or replacement path")
+        .option("--keep-replacement", "Keep the replacement note on disk and only remove the artifact record", false)
+        .action(async (selector: string, opts: { keepReplacement?: boolean }) => {
+          const result = await deleteCompactionArtifact({
+            workspaceDir,
+            selector,
+            keepReplacement: opts.keepReplacement === true,
+          });
+          console.log(
+            `[memory] deleted compaction artifact ${result.artifactId} (${toolDisplayPath("memory", result.replacementPath)})${result.deletedReplacement ? "" : " [replacement kept or already missing]"}`,
+          );
+        });
+
+      cognee
+        .command("compaction-rebuild")
+        .description("Reindex or regenerate a compaction artifact from its source when available")
+        .argument("<selector>", "Artifact id, source path, or replacement path")
+        .option("--title <title>", "Optional regenerated durable artifact title")
+        .option("--delete-source", "Delete the source file after regeneration", false)
+        .action(async (selector: string, opts: { title?: string; deleteSource?: boolean }) => {
+          const result = await rebuildCompactionArtifact({
+            workspaceDir,
+            selector,
+            title: opts.title,
+            deleteSource: opts.deleteSource === true,
+          });
+          console.log(
+            `[memory] ${result.mode} compaction artifact ${result.artifactId} -> ${toolDisplayPath("memory", result.replacementPath)}${result.summaryMode ? ` [${result.summaryMode}${result.summaryModelRef ? ` via ${result.summaryModelRef}` : ""}]` : ""}${result.fallbackReason ? ` [fallback: ${result.fallbackReason}]` : ""}`,
+          );
         });
 
       cognee

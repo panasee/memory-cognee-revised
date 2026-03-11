@@ -31,8 +31,14 @@ type CogneePluginConfig = {
     autoRecall?: boolean;
     autoIndex?: boolean;
     autoCognify?: boolean;
+    pinnedPaths?: string[];
+    pinnedMaxResults?: number;
+    memoryStoreMaxChars?: number;
     requestTimeoutMs?: number;
     ingestionTimeoutMs?: number;
+    summaryModel?: string;
+    summaryProvider?: string;
+    summaryMaxTokens?: number;
     datasets?: Partial<Record<DatasetKey, DatasetProfileConfig>>;
 };
 type ResolvedCogneePluginConfig = {
@@ -48,6 +54,12 @@ type ResolvedCogneePluginConfig = {
     maxTokens: number;
     requestTimeoutMs: number;
     ingestionTimeoutMs: number;
+    pinnedPaths: string[];
+    pinnedMaxResults: number;
+    memoryStoreMaxChars: number;
+    summaryModel: string;
+    summaryProvider: string;
+    summaryMaxTokens: number;
     datasets: Record<DatasetKey, ResolvedDatasetProfile>;
 };
 type CogneeSearchResult = {

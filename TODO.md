@@ -1,84 +1,235 @@
 # TODO
 
-## Long-Term Memory Reinforcement / Decay
+This TODO describes the incremental features that must be added on top of the original `@cognee/cognee-openclaw` plugin.
 
-Goal: improve long-term memory retrieval quality without taking over OpenClaw ContextEngine responsibilities.
+Use the original plugin as the baseline and implement only the additional capabilities listed here.
 
-### Constraints
+## 1. Add Fixed Dataset Profiles
 
-- Only affect memory retrieval ranking and observability.
-- Do not implement plugin-owned context assembly, compaction, or prompt orchestration.
-- Do not auto-delete memories in the first version.
-- Do not rewrite user-authored memory files automatically.
+The original plugin has a single dataset-oriented configuration model.
 
-### Minimal V1
+Add support for two fixed dataset profiles:
 
-- Add a local stats file for memory access signals.
-  - Proposed path: `~/.openclaw/memory/cognee/memory-stats.json`
-- Track per-memory lightweight signals:
-  - `recallCount`
-  - `searchHitCount`
-  - `lastAccessedAt`
-  - `createdAt`
-- Update stats when:
-  - a memory is selected for auto-recall
-  - a memory appears in `memory_search` results
-- Apply a small ranking adjustment on top of Cognee score:
-  - slightly boost frequently accessed memories
-  - slightly decay long-unaccessed memories
-  - keep `pinned` higher priority than dynamic ranking
+- `memory`
+- `library`
 
-### Explicit Non-Goals For V1
+### New config additions
 
-- no automatic deletion / hard forgetting
-- no automatic summarization or compaction
-- no automatic memory file rewrites
-- no usage inference from final model output
-- no ContextEngine-style token budgeting
+- `datasets.memory.datasetName`
+- `datasets.memory.autoIndex`
+- `datasets.memory.autoCognify`
+- `datasets.memory.autoRecall`
+- `datasets.library.datasetName`
+- `datasets.library.paths`
+- `datasets.library.autoIndex`
+- `datasets.library.autoCognify`
+- `datasets.library.autoRecall`
 
-### Nice Follow-Ups
+### Intended behavior
 
-- expose stale / reinforced memory stats in `memory_status` and `cognee status`
-- add CLI inspection for top reinforced and most stale memories
-- consider a manual cleanup workflow after enough stats accumulate
+- `memory` is the primary OpenClaw memory dataset
+- `library` is the external reference dataset
+- `library` must not auto-index, auto-cognify, or auto-recall unless explicitly targeted
 
-## OpenClaw Memory Layer Compatibility Note
+## 2. Add Dataset-Specific Sync Indexes
 
-Current positioning of this plugin should remain:
+The original plugin uses a single sync index.
 
-- primary role: Semantic Memory backend
-- secondary role: semantic-memory retrieval quality enhancements
-- intended replacement for `memory-core`
-- not a replacement for ContextEngine
+Add per-dataset-profile sync indexes:
 
-### Compatible Boundaries
+- `~/.openclaw/memory/cognee/sync-indexes/memory.json`
+- `~/.openclaw/memory/cognee/sync-indexes/library.json`
 
-- okay:
-  - file-backed long-term memory sync
-  - scoped semantic-memory datasets
-  - recall gating / cooldown / filtering
-  - pinned-memory prioritization
-  - memory search / status / store / forget tooling
-  - retrieval metadata such as `path`, `scope`, `pinned`, `title`
+### Requirements
 
-- avoid:
-  - plugin-owned context assembly pipelines
-  - session compaction logic
-  - episodic/session-summary memory orchestration
-  - procedural-memory ownership (skills / system-prompt behavior control)
-  - token budgeting / context partitioning rules
+- `memory` sync state must be independent from `library`
+- keep legacy fallback only if needed for transition
 
-### OpenClaw Layer Mapping
+## 3. Add Multi-Workspace Aggregation For `memory`
 
-- Working / transient memory:
-  - owned by OpenClaw ContextEngine and runtime prompt assembly
-- Episodic memory:
-  - should remain session/transcript oriented, not owned by this plugin
-- Semantic memory:
-  - this plugin's main responsibility
-- Procedural memory:
-  - should remain in system prompts / skills, not migrated into Cognee memory
+The original plugin scans only one workspace.
 
-### Integration Risk To Watch
+Extend it so the `memory` dataset aggregates:
 
-- future changes should prefer semantic-memory enhancements over broader prompt-management features
+- main workspace:
+  - `MEMORY.md`
+  - `memory/*.md`
+  - `memory/**/*.md`
+- every configured agent workspace:
+  - `MEMORY.md`
+  - `memory/*.md`
+  - `memory/**/*.md`
+
+### Workspace discovery
+
+Read workspaces from:
+
+- `~/.openclaw/openclaw.json`
+- `agents.defaults.workspace`
+- `agents.list[].workspace`
+
+Do not hardcode the folder naming pattern.
+
+### Virtual path requirement
+
+To avoid path collisions, add stable virtual prefixes:
+
+- `main/...`
+- `agents/<agentId>/...`
+
+Examples:
+
+- `main/MEMORY.md`
+- `main/memory/2026-03-11.md`
+- `agents/academic-bot/MEMORY.md`
+- `agents/academic-bot/memory/notes.md`
+
+## 4. Add Explicit `library` Dataset Scanning
+
+The original plugin does not distinguish external reference material.
+
+Add `library` dataset scanning for explicit configured paths only.
+
+### Requirements
+
+- every configured path supports:
+  - `*.md`
+  - `**/*.md`
+- `library` is never auto-scanned unless the `library` dataset is explicitly targeted
+
+## 5. Add Dataset-Aware CLI Routing
+
+Keep `openclaw cognee ...` as the operator entrypoint and extend it with dataset targeting.
+
+### Commands that must understand dataset selection
+
+- `openclaw cognee status`
+- `openclaw cognee index`
+- `openclaw cognee search`
+- `openclaw cognee cognify`
+
+### Required flags
+
+- `--dataset memory`
+- `--dataset library`
+
+### Defaults
+
+- default operator target is `memory`
+- `library` moves only when explicitly selected
+
+## 6. Add Dataset-Aware Tool Routing
+
+The original plugin tools assume a single active dataset.
+
+Extend tools so they can work against dataset profiles.
+
+### Tools to extend
+
+- `memory_search`
+- `memory_get`
+- `memory_store`
+- `memory_forget`
+
+### Default behavior
+
+- default tool target is `memory`
+- `library` must only be used when explicitly requested
+
+## 7. Add Lightweight Ranking Signals
+
+The original plugin does not provide local retrieval reinforcement / decay.
+
+Add local ranking signals:
+
+- `recallCount`
+- `searchHitCount`
+- time decay
+- `forgetCount`
+- adjusted score output
+
+### Requirements
+
+- stats are tracked per dataset
+- signals affect retrieval ordering, not stored file content
+
+## 8. Add Deprioritize Workflow
+
+The original plugin supports delete but not weak forgetting.
+
+Add a weak-forgetting path:
+
+- `deprioritize`
+
+### Intended behavior
+
+- do not delete the file
+- lower retrieval priority
+- keep the memory available for later explicit use if needed
+
+## 9. Add Critical Purge Workflow
+
+The original plugin supports ordinary deletion, but not a heavy “must disappear” path.
+
+Add:
+
+- `purge-critical`
+
+### Intended behavior
+
+- delete the target file
+- rebuild the affected dataset from remaining file-backed truth
+
+### Intended usage
+
+Use for:
+
+- wrong rules
+- invalid policies
+- dangerous misinformation
+
+## 10. Add Diagnostics And Operator Visibility
+
+The original plugin has only basic sync status.
+
+Add richer diagnostics:
+
+- dataset health summary
+- indexed file count
+- data-ID coverage
+- dirty / new file counts
+- ranking signal summary
+- stats inspection
+
+## 11. Add Cleanup Suggestion Workflow
+
+The original plugin has no maintenance workflow for stale memory.
+
+Add:
+
+- stats inspection
+- cleanup suggestions
+- optional explicit cleanup apply flow
+
+### Important behavior
+
+- suggestions should be read-only by default
+- explicit apply is allowed
+- no automatic silent cleanup
+
+## 12. Add Tests For New Features
+
+The original test suite does not cover the new dataset-profile model.
+
+Add tests for:
+
+- dataset profile config parsing
+- dataset-specific sync index loading/saving
+- workspace map parsing from OpenClaw config
+- aggregated `memory` path prefixing
+- `library` path discovery
+- dataset-targeted CLI behavior
+- ranking signal behavior
+- deprioritize behavior
+- purge-critical behavior
+

@@ -23,6 +23,22 @@
         "type": "string",
         "description": "Cognee login password (default: default_password)"
       },
+      "datasetName": {
+        "type": "string",
+        "description": "Legacy compatibility field. Maps to datasets.memory.datasetName."
+      },
+      "autoIndex": {
+        "type": "boolean",
+        "description": "Legacy compatibility field. Maps to datasets.memory.autoIndex."
+      },
+      "autoCognify": {
+        "type": "boolean",
+        "description": "Legacy compatibility field. Maps to datasets.memory.autoCognify."
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "description": "Legacy compatibility field. Accepted as memory dataset metadata only; this plugin does not inject runtime context."
+      },
       "searchType": {
         "type": "string",
         "enum": ["GRAPH_COMPLETION", "CHUNKS", "SUMMARIES"],
@@ -44,6 +60,31 @@
       "maxTokens": {
         "type": "number",
         "description": "Token cap passed to Cognee search (default: 512)"
+      },
+      "pinnedPaths": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Legacy compatibility field for pinned memory note paths in the memory dataset."
+      },
+      "pinnedMaxResults": {
+        "type": "number",
+        "description": "Legacy compatibility field for the maximum number of pinned memory results."
+      },
+      "memoryStoreMaxChars": {
+        "type": "number",
+        "description": "Legacy compatibility field for the maximum text length accepted by memory_store."
+      },
+      "summaryModel": {
+        "type": "string",
+        "description": "Optional model ref or model id used for compact-memory distillation. Defaults to OpenClaw's configured primary model."
+      },
+      "summaryProvider": {
+        "type": "string",
+        "description": "Optional provider override for compact-memory distillation when summaryModel is not a full provider/model ref."
+      },
+      "summaryMaxTokens": {
+        "type": "number",
+        "description": "Maximum output tokens used when distilling compacted durable memory (default: 900)."
       },
       "requestTimeoutMs": {
         "type": "number",
@@ -133,6 +174,43 @@
       "label": "Password",
       "sensitive": true,
       "placeholder": "default_password"
+    },
+    "datasetName": {
+      "label": "Dataset Name",
+      "placeholder": "project-memory"
+    },
+    "autoIndex": {
+      "label": "Auto-Index"
+    },
+    "autoCognify": {
+      "label": "Auto-Cognify"
+    },
+    "autoRecall": {
+      "label": "Auto-Recall"
+    },
+    "pinnedPaths": {
+      "label": "Pinned Paths",
+      "placeholder": "[\"memory/global/core-rules.md\"]"
+    },
+    "pinnedMaxResults": {
+      "label": "Pinned Max Results",
+      "placeholder": "2"
+    },
+    "memoryStoreMaxChars": {
+      "label": "Memory Store Max Chars",
+      "placeholder": "4000"
+    },
+    "summaryModel": {
+      "label": "Summary Model",
+      "placeholder": "openai-codex/gpt-5.3-codex"
+    },
+    "summaryProvider": {
+      "label": "Summary Provider",
+      "placeholder": "openai-codex"
+    },
+    "summaryMaxTokens": {
+      "label": "Summary Max Tokens",
+      "placeholder": "900"
     },
     "datasets": {
       "label": "Datasets",
