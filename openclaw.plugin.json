@@ -1,0 +1,142 @@
+{
+  "id": "cognee-openclaw",
+  "name": "Memory (Cognee)",
+  "kind": "memory",
+  "description": "Cognee-backed memory dataset manager for file-backed memory and library indexes. This plugin does not manage prompt context.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "description": "Cognee API base URL (default: http://localhost:8000)"
+      },
+      "apiKey": {
+        "type": "string",
+        "description": "Cognee API key (or use ${COGNEE_API_KEY})"
+      },
+      "username": {
+        "type": "string",
+        "description": "Cognee login username (default: default_user@example.com)"
+      },
+      "password": {
+        "type": "string",
+        "description": "Cognee login password (default: default_password)"
+      },
+      "searchType": {
+        "type": "string",
+        "enum": ["GRAPH_COMPLETION", "CHUNKS", "SUMMARIES"],
+        "description": "Cognee search mode"
+      },
+      "deleteMode": {
+        "type": "string",
+        "enum": ["soft", "hard"],
+        "description": "Cognee delete mode for removed file-backed memory (default: soft)"
+      },
+      "maxResults": {
+        "type": "number",
+        "description": "Maximum search results returned by CLI/tools (default: 6)"
+      },
+      "minScore": {
+        "type": "number",
+        "description": "Minimum retrieval score after local ranking adjustment (default: 0)"
+      },
+      "maxTokens": {
+        "type": "number",
+        "description": "Token cap passed to Cognee search (default: 512)"
+      },
+      "requestTimeoutMs": {
+        "type": "number",
+        "description": "HTTP timeout in milliseconds for Cognee requests (default: 60000)"
+      },
+      "ingestionTimeoutMs": {
+        "type": "number",
+        "description": "HTTP timeout in milliseconds for add/update requests (default: 300000)"
+      },
+      "searchPrompt": {
+        "type": "string",
+        "description": "Optional system prompt sent to Cognee search"
+      },
+      "datasets": {
+        "type": "object",
+        "description": "Fixed dataset profiles. This plugin manages memory datasets only; it does not inject prompt context.",
+        "additionalProperties": false,
+        "properties": {
+          "memory": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "datasetName": {
+                "type": "string",
+                "description": "Cognee dataset name for the primary memory dataset"
+              },
+              "autoIndex": {
+                "type": "boolean",
+                "description": "Auto-sync the memory dataset on startup and after agent runs (default: true)"
+              },
+              "autoCognify": {
+                "type": "boolean",
+                "description": "Run cognify after new memory entries are added (default: true)"
+              },
+              "autoRecall": {
+                "type": "boolean",
+                "description": "Compatibility metadata only. This plugin does not inject runtime context."
+              }
+            }
+          },
+          "library": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "datasetName": {
+                "type": "string",
+                "description": "Cognee dataset name for the explicit reference library dataset"
+              },
+              "paths": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Explicit markdown roots for the library dataset"
+              },
+              "autoIndex": {
+                "type": "boolean",
+                "description": "Auto-sync the library dataset (default: false)"
+              },
+              "autoCognify": {
+                "type": "boolean",
+                "description": "Run cognify after new library entries are added (default: false)"
+              },
+              "autoRecall": {
+                "type": "boolean",
+                "description": "Compatibility metadata only. This plugin does not inject runtime context."
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "baseUrl": {
+      "label": "Base URL",
+      "placeholder": "http://localhost:8000"
+    },
+    "apiKey": {
+      "label": "API Key",
+      "sensitive": true,
+      "placeholder": "${COGNEE_API_KEY}"
+    },
+    "username": {
+      "label": "Username",
+      "placeholder": "default_user@example.com"
+    },
+    "password": {
+      "label": "Password",
+      "sensitive": true,
+      "placeholder": "default_password"
+    },
+    "datasets": {
+      "label": "Datasets",
+      "placeholder": "{ \"memory\": { \"datasetName\": \"project-memory\" }, \"library\": { \"datasetName\": \"project-library\", \"paths\": [\"./library\"] } }"
+    }
+  }
+}
