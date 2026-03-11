@@ -1,6 +1,6 @@
 {
-  "id": "cognee-openclaw",
-  "name": "Memory (Cognee)",
+  "id": "memory-cognee-revised",
+  "name": "memory-cognee-revised",
   "kind": "memory",
   "description": "Cognee-backed memory dataset manager for file-backed memory and library indexes. This plugin does not manage prompt context.",
   "configSchema": {
@@ -85,6 +85,22 @@
       "summaryMaxTokens": {
         "type": "number",
         "description": "Maximum output tokens used when distilling compacted durable memory (default: 900)."
+      },
+      "retainedAssetWarnBytes": {
+        "type": "number",
+        "description": "Soft warning threshold for total retained library bytes (default: 536870912)."
+      },
+      "retainedAssetWarnCount": {
+        "type": "number",
+        "description": "Soft warning threshold for retained library asset count (default: 500)."
+      },
+      "retainedAssetMaxBytes": {
+        "type": "number",
+        "description": "Optional hard limit for total retained library bytes. Imports fail after this budget is exceeded."
+      },
+      "retainedAssetMaxCount": {
+        "type": "number",
+        "description": "Optional hard limit for retained library asset count. Imports fail after this budget is exceeded."
       },
       "requestTimeoutMs": {
         "type": "number",
@@ -211,6 +227,22 @@
     "summaryMaxTokens": {
       "label": "Summary Max Tokens",
       "placeholder": "900"
+    },
+    "retainedAssetWarnBytes": {
+      "label": "Retained Warn Bytes",
+      "placeholder": "536870912"
+    },
+    "retainedAssetWarnCount": {
+      "label": "Retained Warn Count",
+      "placeholder": "500"
+    },
+    "retainedAssetMaxBytes": {
+      "label": "Retained Max Bytes",
+      "placeholder": "1073741824"
+    },
+    "retainedAssetMaxCount": {
+      "label": "Retained Max Count",
+      "placeholder": "1000"
     },
     "datasets": {
       "label": "Datasets",

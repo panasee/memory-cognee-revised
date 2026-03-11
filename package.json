@@ -1,5 +1,5 @@
 {
-  "name": "@cognee/cognee-openclaw",
+  "name": "memory-cognee-revised",
   "version": "2026.3.0",
   "type": "module",
   "description": "OpenClaw Cognee-backed memory dataset manager for file-backed memory and library indexes",

@@ -6,11 +6,11 @@
 integrations:
 
   - slug: openclaw
-    name: "Memory (Cognee) for OpenClaw"
+    name: "memory-cognee-revised"
     owner: cognee
     language: typescript
     registry: npm
-    package_name: "@cognee/cognee-openclaw"
+    package_name: "memory-cognee-revised"
     cognee_dependency: http-api
     current_version: "2026.3.0"
     notes: "OpenClaw memory dataset manager for file-backed memory/library indexing; not a context engine"

@@ -1,6 +1,6 @@
 # Compatibility Gaps
 
-This file tracks behavior that existed in the pre-dataset plugin but is still missing or intentionally changed in the current `cognee-openclaw` implementation.
+This file tracks behavior that existed in the pre-dataset plugin but is still missing or intentionally changed in the current `memory-cognee-revised` implementation.
 
 It is meant to support later merge work and compatibility follow-up.
 

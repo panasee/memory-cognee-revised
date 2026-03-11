@@ -16,6 +16,16 @@ const DEFAULT_INGESTION_TIMEOUT_MS = 300_000;
 const DEFAULT_PINNED_MAX_RESULTS = 2;
 const DEFAULT_MEMORY_STORE_MAX_CHARS = 4_000;
 const DEFAULT_SUMMARY_MAX_TOKENS = 900;
+const DEFAULT_RETAINED_ASSET_WARN_BYTES = 512 * 1024 * 1024;
+const DEFAULT_RETAINED_ASSET_WARN_COUNT = 500;
+const DEFAULT_MEMORY_DAILY_DECAY = 0.01;
+const DEFAULT_LIBRARY_DAILY_DECAY = 0.0025;
+const DEFAULT_MEMORY_MAX_DECAY = 0.4;
+const DEFAULT_LIBRARY_MAX_DECAY = 0.15;
+const DEFAULT_MEMORY_STALE_DAYS = 90;
+const DEFAULT_LIBRARY_STALE_DAYS = 365;
+const DEFAULT_MEMORY_DEPRIORITIZED_GRACE_DAYS = 30;
+const DEFAULT_LIBRARY_DEPRIORITIZED_GRACE_DAYS = 180;
 const DEFAULT_MEMORY_AUTO_INDEX = true;
 const DEFAULT_MEMORY_AUTO_COGNIFY = true;
 const DEFAULT_MEMORY_AUTO_RECALL = true;
@@ -25,7 +35,7 @@ const DEFAULT_LIBRARY_AUTO_RECALL = false;
 const MAX_RETRIES = 2;
 const RETRY_BASE_DELAY_MS = 3_000;
 const TOOL_NOTE_DIRNAME = "_tool";
-const MANAGED_BY_MARKER = "cognee-openclaw";
+const MANAGED_BY_MARKER = "memory-cognee-revised";
 const LEGACY_MANAGED_BY_MARKERS = new Set(["cognee-openclaw", "memory-cognee-revised"]);
 const COGNEE_ROOT = join(homedir(), ".openclaw", "memory", "cognee");
 const STATE_PATH = join(COGNEE_ROOT, "datasets.json");
@@ -259,8 +269,100 @@ function retainedAssetExists(asset) {
         typeof asset.title === "string" &&
         typeof asset.importedAt === "string" &&
         typeof asset.contentHash === "string" &&
+        (asset.sizeBytes === undefined || typeof asset.sizeBytes === "number") &&
         typeof asset.storagePath === "string" &&
         typeof asset.virtualPath === "string";
+}
+function retainedAssetSizeBytes(asset) {
+    return typeof asset.sizeBytes === "number" && Number.isFinite(asset.sizeBytes) && asset.sizeBytes >= 0
+        ? asset.sizeBytes
+        : 0;
+}
+function formatBytes(value) {
+    if (!Number.isFinite(value) || value <= 0) {
+        return "0 B";
+    }
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let size = value;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+    }
+    return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
+}
+function classifyCompactionProfile(file) {
+    const normalizedPath = file.path.toLowerCase();
+    if (normalizedPath.includes("/daily/") || /\/\d{4}-\d{2}-\d{2}[^/]*\.md$/i.test(normalizedPath)) {
+        return "daily-log";
+    }
+    if (normalizedPath.includes("/worklog/") ||
+        normalizedPath.includes("/journal/") ||
+        normalizedPath.includes("/scratch/") ||
+        normalizedPath.includes("/meeting/")) {
+        return "worklog";
+    }
+    if (normalizedPath.includes("/reference/") ||
+        normalizedPath.includes("/research/") ||
+        normalizedPath.includes("/notes/") ||
+        normalizedPath.includes("/docs/")) {
+        return "reference-note";
+    }
+    return "general";
+}
+function buildCompactionSystemPrompt(profile) {
+    const common = [
+        "You compact raw OpenClaw memory into durable long-term memory.",
+        "Preserve only information that should survive source-file cleanup.",
+        "Drop low-signal narration, duplicated prose, and timestamps unless they matter for future decisions.",
+        'Return markdown only. Prefer concise sections with short bullets. If there is nothing durable, return exactly "NO_DURABLE_MEMORY".',
+    ];
+    if (profile === "daily-log") {
+        return [
+            ...common,
+            "This source is a daily log or transient work journal.",
+            "Extract only durable outcomes:",
+            "- decisions made",
+            "- reusable procedures or commands",
+            "- stable preferences, constraints, and commitments",
+            "- unresolved follow-ups only if they remain actionable later",
+            'Use sections chosen from "Summary", "Decisions", "Reusable Procedures", "Open Threads".',
+            "Do not rewrite the whole day chronologically.",
+        ].join("\n");
+    }
+    if (profile === "worklog") {
+        return [
+            ...common,
+            "This source is an execution log, meeting note, or scratchpad.",
+            "Keep durable technical state only:",
+            "- what changed",
+            "- why it changed",
+            "- stable commands/config/procedures worth reusing",
+            "- risks and pending follow-ups",
+            'Use sections chosen from "Summary", "Technical State", "Reusable Procedures", "Risks", "Open Threads".',
+        ].join("\n");
+    }
+    if (profile === "reference-note") {
+        return [
+            ...common,
+            "This source is a reference or research note.",
+            "Prefer a distilled knowledge artifact:",
+            "- core facts",
+            "- decision-relevant comparisons",
+            "- caveats, limits, and citations/path references when useful",
+            'Use sections chosen from "Summary", "Durable Facts", "Caveats", "References".',
+        ].join("\n");
+    }
+    return [
+        ...common,
+        "Preserve stable facts, decisions, procedures, preferences, constraints, and reusable references.",
+        'Use sections chosen from "Summary", "Durable Facts", "Procedures", "Open Threads".',
+    ].join("\n");
+}
+function summarizeCompactionSource(file) {
+    const body = buildPreservedCompactionBody(file);
+    const lines = body.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    return lines.slice(0, 12).join("\n");
 }
 function inferLifecycleForPath(datasetKey, path, compactionManifest) {
     if (datasetKey === "library" && path.startsWith("retained/")) {
@@ -309,7 +411,7 @@ function buildCompactedMemoryContent(params) {
         "",
     ].join("\n");
 }
-function computeCompactSuggestions(files, manifest, now = Date.now()) {
+function computeCompactSuggestions(files, manifest, cfg, now = Date.now()) {
     const compacted = new Map(manifest.artifacts.map((artifact) => [`${artifact.sourcePath}:${artifact.sourceHash}`, artifact]));
     return files
         .filter((file) => !isToolManagedMemoryFile(file))
@@ -317,15 +419,27 @@ function computeCompactSuggestions(files, manifest, now = Date.now()) {
         .filter((file) => !compacted.has(`${file.path}:${file.hash}`))
         .map((file) => {
         const lowerPath = file.path.toLowerCase();
+        const profile = classifyCompactionProfile(file);
+        const policy = cfg.compactionPolicies[profile];
         const ageDays = (now - file.mtimeMs) / 86_400_000;
         let reason = "";
-        if (lowerPath.includes("/daily/") || /\/\d{4}-\d{2}-\d{2}[^/]*\.md$/i.test(lowerPath)) {
+        if (policy.strategy === "retained-import") {
+            reason = "reference-style note should move to retained library import instead of memory compaction";
+        }
+        else if (policy.strategy === "skip") {
+            reason = "";
+        }
+        else if (lowerPath.includes("/daily/") || /\/\d{4}-\d{2}-\d{2}[^/]*\.md$/i.test(lowerPath)) {
             if (ageDays >= 3) {
-                reason = "dated/daily note older than 3 days";
+                reason = policy.defaultDeleteSource
+                    ? "dated/daily note older than 3 days; default policy is distill + delete source"
+                    : "dated/daily note older than 3 days";
             }
         }
         else if (ageDays >= 30) {
-            reason = "stale raw note older than 30 days";
+            reason = policy.defaultDeleteSource
+                ? "stale raw note older than 30 days; default policy deletes source after distillation"
+                : "stale raw note older than 30 days; default policy keeps source after distillation";
         }
         return { path: file.path, reason };
     })
@@ -406,7 +520,8 @@ function adjustSearchScore(params) {
     const now = params.now ?? Date.now();
     const freshness = Math.max(params.fileMtimeMs ?? 0, signals.lastHitAt ?? 0, signals.lastRecallAt ?? 0, signals.lastStoredAt ?? 0);
     const ageDays = freshness > 0 ? (now - freshness) / 86_400_000 : 365;
-    const decay = Math.min(0.4, Math.max(0, ageDays) * 0.01);
+    const policy = params.cfg.rankingPolicies[params.datasetKey];
+    const decay = Math.min(policy.maxDecay, Math.max(0, ageDays) * policy.dailyDecay);
     const boost = signals.searchHitCount * 0.03 + signals.recallCount * 0.05;
     const penalty = signals.forgetCount * 0.12 + (signals.deprioritized ? 0.25 : 0);
     return Number((params.baseScore + boost - penalty - decay).toFixed(6));
@@ -485,6 +600,42 @@ function resolveConfig(rawConfig) {
         summaryModel: typeof raw.summaryModel === "string" ? raw.summaryModel.trim() : "",
         summaryProvider: typeof raw.summaryProvider === "string" ? raw.summaryProvider.trim() : "",
         summaryMaxTokens: typeof raw.summaryMaxTokens === "number" ? raw.summaryMaxTokens : DEFAULT_SUMMARY_MAX_TOKENS,
+        retainedAssetWarnBytes: typeof raw.retainedAssetWarnBytes === "number" ? raw.retainedAssetWarnBytes : DEFAULT_RETAINED_ASSET_WARN_BYTES,
+        retainedAssetWarnCount: typeof raw.retainedAssetWarnCount === "number" ? raw.retainedAssetWarnCount : DEFAULT_RETAINED_ASSET_WARN_COUNT,
+        retainedAssetMaxBytes: typeof raw.retainedAssetMaxBytes === "number" ? raw.retainedAssetMaxBytes : undefined,
+        retainedAssetMaxCount: typeof raw.retainedAssetMaxCount === "number" ? raw.retainedAssetMaxCount : undefined,
+        rankingPolicies: {
+            memory: {
+                dailyDecay: DEFAULT_MEMORY_DAILY_DECAY,
+                maxDecay: DEFAULT_MEMORY_MAX_DECAY,
+                staleDays: DEFAULT_MEMORY_STALE_DAYS,
+                deprioritizedGraceDays: DEFAULT_MEMORY_DEPRIORITIZED_GRACE_DAYS,
+            },
+            library: {
+                dailyDecay: DEFAULT_LIBRARY_DAILY_DECAY,
+                maxDecay: DEFAULT_LIBRARY_MAX_DECAY,
+                staleDays: DEFAULT_LIBRARY_STALE_DAYS,
+                deprioritizedGraceDays: DEFAULT_LIBRARY_DEPRIORITIZED_GRACE_DAYS,
+            },
+        },
+        compactionPolicies: {
+            "daily-log": {
+                defaultDeleteSource: true,
+                strategy: "distill-delete",
+            },
+            worklog: {
+                defaultDeleteSource: false,
+                strategy: "distill-keep",
+            },
+            "reference-note": {
+                defaultDeleteSource: false,
+                strategy: "retained-import",
+            },
+            general: {
+                defaultDeleteSource: false,
+                strategy: "distill-keep",
+            },
+        },
         datasets: {
             memory: {
                 datasetName: memoryRaw.datasetName?.trim() ||
@@ -600,6 +751,91 @@ async function saveCompactionManifest(manifest) {
     await fs.mkdir(dirname(COMPACTION_MANIFEST_PATH), { recursive: true });
     await fs.writeFile(COMPACTION_MANIFEST_PATH, JSON.stringify(manifest, null, 2), "utf-8");
 }
+function summarizeRetainedCapacity(manifest, cfg) {
+    const assetCount = manifest.assets.length;
+    const totalBytes = manifest.assets.reduce((sum, asset) => sum + retainedAssetSizeBytes(asset), 0);
+    return {
+        assetCount,
+        totalBytes,
+        warnCountExceeded: assetCount > cfg.retainedAssetWarnCount,
+        warnBytesExceeded: totalBytes > cfg.retainedAssetWarnBytes,
+        maxCountExceeded: typeof cfg.retainedAssetMaxCount === "number" && assetCount > cfg.retainedAssetMaxCount,
+        maxBytesExceeded: typeof cfg.retainedAssetMaxBytes === "number" && totalBytes > cfg.retainedAssetMaxBytes,
+    };
+}
+function buildRetainedCapacityLines(summary) {
+    return [
+        `Retained bytes: ${formatBytes(summary.totalBytes)}`,
+        ...(summary.warnBytesExceeded || summary.warnCountExceeded
+            ? ["Retained budget warning: exceeded soft capacity threshold"]
+            : []),
+        ...(summary.maxBytesExceeded || summary.maxCountExceeded
+            ? ["Retained budget violation: exceeded hard capacity limit"]
+            : []),
+    ];
+}
+function computeRetainedCleanupSuggestions(manifest, syncIndex, cfg, limit = 10) {
+    const suggestions = [];
+    const seenHashes = new Set();
+    const duplicates = new Set();
+    for (const asset of manifest.assets) {
+        if (seenHashes.has(asset.contentHash)) {
+            duplicates.add(asset.contentHash);
+        }
+        else {
+            seenHashes.add(asset.contentHash);
+        }
+    }
+    for (const asset of manifest.assets) {
+        const sizeBytes = retainedAssetSizeBytes(asset);
+        if (duplicates.has(asset.contentHash)) {
+            suggestions.push({
+                assetId: asset.assetId,
+                virtualPath: asset.virtualPath,
+                title: asset.title,
+                sizeBytes,
+                reason: "duplicate content hash retained multiple times",
+            });
+            continue;
+        }
+        if (!syncIndex.entries[asset.virtualPath]) {
+            suggestions.push({
+                assetId: asset.assetId,
+                virtualPath: asset.virtualPath,
+                title: asset.title,
+                sizeBytes,
+                reason: "retained asset is present in manifest but not indexed",
+            });
+        }
+    }
+    const capacity = summarizeRetainedCapacity(manifest, cfg);
+    if (capacity.warnBytesExceeded ||
+        capacity.warnCountExceeded ||
+        capacity.maxBytesExceeded ||
+        capacity.maxCountExceeded) {
+        const sortedOldestFirst = [...manifest.assets].sort((a, b) => {
+            const timeA = Date.parse(a.importedAt) || 0;
+            const timeB = Date.parse(b.importedAt) || 0;
+            if (timeA !== timeB)
+                return timeA - timeB;
+            return retainedAssetSizeBytes(b) - retainedAssetSizeBytes(a);
+        });
+        for (const asset of sortedOldestFirst) {
+            const key = `${asset.assetId}:${asset.virtualPath}`;
+            if (suggestions.some((entry) => `${entry.assetId}:${entry.virtualPath}` === key)) {
+                continue;
+            }
+            suggestions.push({
+                assetId: asset.assetId,
+                virtualPath: asset.virtualPath,
+                title: asset.title,
+                sizeBytes: retainedAssetSizeBytes(asset),
+                reason: "old retained asset candidate while library capacity budget is exceeded",
+            });
+        }
+    }
+    return suggestions.slice(0, limit);
+}
 function extractCompletionText(result) {
     if (!isRecord(result)) {
         return "";
@@ -642,6 +878,7 @@ async function distillMemoryFile(params) {
     catch {
         runtimeConfig = params.api.config;
     }
+    const profile = classifyCompactionProfile(params.file);
     const selection = resolveSummaryModelSelection({
         summaryModel: params.cfg.summaryModel,
         summaryProvider: params.cfg.summaryProvider,
@@ -703,24 +940,21 @@ async function distillMemoryFile(params) {
         }
         const title = params.title?.trim() || inferTitleFromPathOrContent(params.file.path, params.file.content);
         const result = await mod.completeSimple(resolvedModel, {
-            systemPrompt: [
-                "You compact raw OpenClaw memory into durable long-term memory.",
-                "Preserve only information that should survive source-file cleanup:",
-                "- stable facts, decisions, procedures, preferences, commitments, constraints, and reusable references",
-                "- unresolved threads only when they remain actionable after the source file is gone",
-                "Drop ephemeral chatter, timestamps, and low-signal narration.",
-                'Return markdown only, with concise sections chosen from "Summary", "Durable Facts", "Procedures", "Open Threads".',
-                'If there is no durable memory, return exactly "NO_DURABLE_MEMORY".',
-            ].join("\n"),
+            systemPrompt: buildCompactionSystemPrompt(profile),
             messages: [
                 {
                     role: "user",
                     content: [
+                        `Compaction profile: ${profile}`,
                         `Source path: ${params.file.path}`,
                         `Candidate title: ${title}`,
+                        `Source age (days): ${Math.max(0, Math.round((Date.now() - params.file.mtimeMs) / 86_400_000))}`,
                         "",
-                        "Source markdown:",
-                        params.file.content.trim(),
+                        "Source preview:",
+                        summarizeCompactionSource(params.file),
+                        "",
+                        "Full source markdown:",
+                        params.file.content.trim().slice(0, 24_000),
                     ].join("\n"),
                     timestamp: Date.now(),
                 },
@@ -1151,7 +1385,7 @@ async function syncFiles(client, changedFiles, fullFiles, syncIndex, cfg, logger
                     syncIndex.datasetId = datasetId;
                     syncIndex.datasetName = cfg.datasetName;
                     result.updated++;
-                    logger.info?.(`cognee-openclaw: [${cfg.datasetKey}] updated ${file.path}`);
+                    logger.info?.(`memory-cognee-revised: [${cfg.datasetKey}] updated ${file.path}`);
                     continue;
                 }
                 catch (error) {
@@ -1159,7 +1393,7 @@ async function syncFiles(client, changedFiles, fullFiles, syncIndex, cfg, logger
                     if (!(message.includes("404") || message.includes("409") || message.includes("not found"))) {
                         throw error;
                     }
-                    logger.info?.(`cognee-openclaw: [${cfg.datasetKey}] update failed for ${file.path}, falling back to add`);
+                    logger.info?.(`memory-cognee-revised: [${cfg.datasetKey}] update failed for ${file.path}, falling back to add`);
                     delete existing.dataId;
                 }
             }
@@ -1179,11 +1413,11 @@ async function syncFiles(client, changedFiles, fullFiles, syncIndex, cfg, logger
             syncIndex.datasetName = cfg.datasetName;
             needsCognify = true;
             result.added++;
-            logger.info?.(`cognee-openclaw: [${cfg.datasetKey}] added ${file.path}`);
+            logger.info?.(`memory-cognee-revised: [${cfg.datasetKey}] added ${file.path}`);
         }
         catch (error) {
             result.errors++;
-            logger.warn?.(`cognee-openclaw: [${cfg.datasetKey}] failed to sync ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
+            logger.warn?.(`memory-cognee-revised: [${cfg.datasetKey}] failed to sync ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
     const currentPaths = new Set(fullFiles.map((file) => file.path));
@@ -1193,7 +1427,7 @@ async function syncFiles(client, changedFiles, fullFiles, syncIndex, cfg, logger
         if (!entry.dataId || !datasetId) {
             delete syncIndex.entries[path];
             result.deleted++;
-            logger.info?.(`cognee-openclaw: [${cfg.datasetKey}] cleaned up orphan index entry ${path}`);
+            logger.info?.(`memory-cognee-revised: [${cfg.datasetKey}] cleaned up orphan index entry ${path}`);
             continue;
         }
         const deleteResult = await client.delete({
@@ -1204,7 +1438,7 @@ async function syncFiles(client, changedFiles, fullFiles, syncIndex, cfg, logger
         if (deleteResult.deleted) {
             delete syncIndex.entries[path];
             result.deleted++;
-            logger.info?.(`cognee-openclaw: [${cfg.datasetKey}] deleted ${path}`);
+            logger.info?.(`memory-cognee-revised: [${cfg.datasetKey}] deleted ${path}`);
             continue;
         }
         const isNotFound = deleteResult.error &&
@@ -1214,19 +1448,19 @@ async function syncFiles(client, changedFiles, fullFiles, syncIndex, cfg, logger
         if (isNotFound) {
             delete syncIndex.entries[path];
             result.deleted++;
-            logger.info?.(`cognee-openclaw: [${cfg.datasetKey}] deleted ${path} (already removed from Cognee)`);
+            logger.info?.(`memory-cognee-revised: [${cfg.datasetKey}] deleted ${path} (already removed from Cognee)`);
             continue;
         }
         result.errors++;
-        logger.warn?.(`cognee-openclaw: [${cfg.datasetKey}] failed to delete ${path}${deleteResult.error ? `: ${deleteResult.error}` : ""}`);
+        logger.warn?.(`memory-cognee-revised: [${cfg.datasetKey}] failed to delete ${path}${deleteResult.error ? `: ${deleteResult.error}` : ""}`);
     }
     if (needsCognify && cfg.autoCognify && datasetId) {
         try {
             await client.cognify({ datasetIds: [datasetId] });
-            logger.info?.(`cognee-openclaw: [${cfg.datasetKey}] cognify dispatched`);
+            logger.info?.(`memory-cognee-revised: [${cfg.datasetKey}] cognify dispatched`);
         }
         catch (error) {
-            logger.warn?.(`cognee-openclaw: [${cfg.datasetKey}] cognify failed: ${error instanceof Error ? error.message : String(error)}`);
+            logger.warn?.(`memory-cognee-revised: [${cfg.datasetKey}] cognify failed: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
     if (saveFn) {
@@ -1237,24 +1471,27 @@ async function syncFiles(client, changedFiles, fullFiles, syncIndex, cfg, logger
     }
     return { ...result, datasetId };
 }
-function computeCleanupSuggestions(files, ranking, now = Date.now()) {
+function computeCleanupSuggestions(datasetKey, files, ranking, cfg, now = Date.now()) {
+    const policy = cfg.rankingPolicies[datasetKey];
     return files
         .map((file) => {
         const signals = ranking.entries[file.path] ?? defaultSignals();
         const adjustedScore = adjustSearchScore({
+            datasetKey,
             baseScore: 0.25,
             signals,
             fileMtimeMs: file.mtimeMs,
             now,
+            cfg,
         });
         let reason = "";
-        if (signals.deprioritized && (signals.lastHitAt ?? 0) < now - 30 * 86_400_000) {
+        if (signals.deprioritized && (signals.lastHitAt ?? 0) < now - policy.deprioritizedGraceDays * 86_400_000) {
             reason = "already deprioritized and not recalled recently";
         }
         else if (signals.forgetCount >= 2) {
             reason = "repeatedly forgotten";
         }
-        else if (signals.searchHitCount === 0 && file.mtimeMs < now - 90 * 86_400_000) {
+        else if (signals.searchHitCount === 0 && file.mtimeMs < now - policy.staleDays * 86_400_000) {
             reason = "stale and never retrieved";
         }
         return { path: file.path, adjustedScore, reason };
@@ -1294,6 +1531,7 @@ function buildDatasetHealthSummary(params) {
         `Ranking forgets: ${rankingSummary.forgets}`,
         `Deprioritized: ${rankingSummary.deprioritized}`,
         ...(typeof params.retainedAssets === "number" ? [`Retained assets: ${params.retainedAssets}`] : []),
+        ...(typeof params.retainedBytes === "number" ? [`Retained bytes: ${formatBytes(params.retainedBytes)}`] : []),
         ...(typeof params.compactionArtifacts === "number" ? [`Compaction artifacts: ${params.compactionArtifacts}`] : []),
         ...(typeof params.llmCompactionArtifacts === "number"
             ? [`LLM-distilled artifacts: ${params.llmCompactionArtifacts}`]
@@ -1371,10 +1609,19 @@ async function importRetainedLibraryAsset(params) {
     const content = await fs.readFile(absSourcePath, "utf-8");
     const title = params.title?.trim() || inferTitleFromPathOrContent(absSourcePath, content);
     const contentHash = hashText(content);
+    const sizeBytes = Buffer.byteLength(content, "utf-8");
     const manifest = await loadRetainedLibraryManifest();
     const existing = manifest.assets.find((asset) => asset.contentHash === contentHash);
     if (existing) {
         return existing;
+    }
+    const nextAssetCount = manifest.assets.length + 1;
+    const nextTotalBytes = manifest.assets.reduce((sum, asset) => sum + retainedAssetSizeBytes(asset), 0) + sizeBytes;
+    if (typeof params.cfg.retainedAssetMaxCount === "number" && nextAssetCount > params.cfg.retainedAssetMaxCount) {
+        throw new Error(`retained library asset limit exceeded: ${nextAssetCount}/${params.cfg.retainedAssetMaxCount}; prune retained assets before importing more`);
+    }
+    if (typeof params.cfg.retainedAssetMaxBytes === "number" && nextTotalBytes > params.cfg.retainedAssetMaxBytes) {
+        throw new Error(`retained library byte budget exceeded: ${formatBytes(nextTotalBytes)}/${formatBytes(params.cfg.retainedAssetMaxBytes)}; prune retained assets before importing more`);
     }
     const assetId = `asset_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const storagePath = retainedLibraryStoragePath(assetId, title);
@@ -1388,6 +1635,7 @@ async function importRetainedLibraryAsset(params) {
         originalPath: absSourcePath,
         importedAt: new Date().toISOString(),
         contentHash,
+        sizeBytes,
         storagePath,
         virtualPath,
     };
@@ -1437,7 +1685,13 @@ async function searchDataset(params) {
             absPath: file.absPath,
             text: file.content,
             baseScore,
-            adjustedScore: adjustSearchScore({ baseScore, signals, fileMtimeMs: file.mtimeMs }),
+            adjustedScore: adjustSearchScore({
+                datasetKey: params.datasetKey,
+                baseScore,
+                signals,
+                fileMtimeMs: file.mtimeMs,
+                cfg: params.cfg,
+            }),
             signals: { ...signals },
         });
     }
@@ -1458,9 +1712,11 @@ async function searchDataset(params) {
                 const signals = params.ranking.entries[path] ?? defaultSignals();
                 const existing = merged.get(path);
                 const adjustedScore = adjustSearchScore({
+                    datasetKey: params.datasetKey,
                     baseScore: result.score,
                     signals,
                     fileMtimeMs: file?.mtimeMs,
+                    cfg: params.cfg,
                 });
                 merged.set(path, {
                     dataset: params.datasetKey,
@@ -1483,8 +1739,8 @@ async function searchDataset(params) {
         .slice(0, limit);
 }
 const memoryCogneePlugin = {
-    id: "cognee-openclaw",
-    name: "Memory (Cognee)",
+    id: "memory-cognee-revised",
+    name: "memory-cognee-revised",
     description: "Cognee-backed memory dataset manager for file-backed memory and library indexes. This plugin does not inject context or implement a context engine.",
     kind: "memory",
     register(api) {
@@ -1499,7 +1755,7 @@ const memoryCogneePlugin = {
             datasetIds.library = state[cfg.datasets.library.datasetName];
         })
             .catch((error) => {
-            api.logger.warn?.(`cognee-openclaw: failed to load dataset state: ${String(error)}`);
+            api.logger.warn?.(`memory-cognee-revised: failed to load dataset state: ${String(error)}`);
         });
         async function ensureDatasetLoaded(datasetKey) {
             await stateReady;
@@ -1709,6 +1965,14 @@ const memoryCogneePlugin = {
             if (isToolManagedMemoryFile(file)) {
                 throw new Error("compact-memory is intended for handwritten or transient memory files, not existing tool-managed notes");
             }
+            const profile = classifyCompactionProfile(file);
+            const compactionPolicy = cfg.compactionPolicies[profile];
+            if (compactionPolicy.strategy === "skip") {
+                throw new Error(`compaction policy skips ${profile} sources`);
+            }
+            if (compactionPolicy.strategy === "retained-import") {
+                throw new Error(`compaction policy routes ${profile} sources to retained library import`);
+            }
             const manifest = await loadCompactionManifest();
             const existing = manifest.artifacts.find((artifact) => artifact.sourcePath === file.path && artifact.sourceHash === file.hash);
             let replacementPath = existing?.replacementPath;
@@ -1756,9 +2020,10 @@ const memoryCogneePlugin = {
                 });
                 await saveCompactionManifest(manifest);
             }
+            const effectiveDeleteSource = params.deleteSource ?? compactionPolicy.defaultDeleteSource;
             let sync = await syncDataset("memory", params.workspaceDir, api.logger);
             let deletedSource = false;
-            if (params.deleteSource) {
+            if (effectiveDeleteSource) {
                 await fs.unlink(file.absPath);
                 deletedSource = true;
                 const manifestAfterDelete = await loadCompactionManifest();
@@ -1796,11 +2061,16 @@ const memoryCogneePlugin = {
                     title: asset.title,
                     virtualPath: asset.virtualPath,
                     storagePath: asset.storagePath,
+                    sizeBytes: retainedAssetSizeBytes(asset),
                     indexed: !!syncIndexes.library?.entries[asset.virtualPath],
                     storageExists,
                     originalPath: asset.originalPath,
                 };
             }));
+        }
+        async function getRetainedCapacitySummary() {
+            const manifest = await loadRetainedLibraryManifest();
+            return summarizeRetainedCapacity(manifest, cfg);
         }
         async function auditCompactionArtifacts(workspaceDir) {
             await ensureDatasetLoaded("memory");
@@ -2032,7 +2302,11 @@ const memoryCogneePlugin = {
                         const indexedFiles = Object.keys(syncIndexes[datasetKey].entries).length;
                         const pinnedCount = datasetKey === "memory" ? countPinnedFiles(files, cfg.pinnedPaths) : 0;
                         const managedCount = datasetKey === "memory" ? countToolManagedFiles(files) : 0;
-                        const retainedCount = datasetKey === "library" ? (await loadRetainedLibraryManifest()).assets.length : undefined;
+                        const retainedManifest = datasetKey === "library" ? await loadRetainedLibraryManifest() : undefined;
+                        const retainedCount = retainedManifest?.assets.length;
+                        const retainedCapacity = datasetKey === "library" && retainedManifest
+                            ? summarizeRetainedCapacity(retainedManifest, cfg)
+                            : undefined;
                         const compactionManifest = datasetKey === "memory" ? await loadCompactionManifest() : undefined;
                         const compactedCount = compactionManifest?.artifacts.length;
                         const llmCompactedCount = compactionManifest?.artifacts.filter((artifact) => artifact.summaryMode === "llm-distilled").length;
@@ -2046,6 +2320,7 @@ const memoryCogneePlugin = {
                             `Pinned files: ${pinnedCount}`,
                             `Tool-managed files: ${managedCount}`,
                             ...(typeof retainedCount === "number" ? [`Retained assets: ${retainedCount}`] : []),
+                            ...(retainedCapacity ? buildRetainedCapacityLines(retainedCapacity) : []),
                             ...(typeof compactedCount === "number" ? [`Compaction artifacts: ${compactedCount}`] : []),
                             ...(typeof llmCompactedCount === "number" ? [`LLM-distilled artifacts: ${llmCompactedCount}`] : []),
                         ];
@@ -2059,6 +2334,8 @@ const memoryCogneePlugin = {
                             pinnedFiles: pinnedCount,
                             toolManagedFiles: managedCount,
                             ...(typeof retainedCount === "number" ? { retainedAssets: retainedCount } : {}),
+                            ...(retainedCapacity ? { retainedBytes: retainedCapacity.totalBytes } : {}),
+                            ...(retainedCapacity ? { retainedBudget: retainedCapacity } : {}),
                             ...(typeof compactedCount === "number" ? { compactionArtifacts: compactedCount } : {}),
                             ...(typeof llmCompactedCount === "number" ? { llmDistilledArtifacts: llmCompactedCount } : {}),
                         });
@@ -2212,7 +2489,11 @@ const memoryCogneePlugin = {
                 const datasetKey = resolveDatasetKey(opts.dataset);
                 await ensureDatasetLoaded(datasetKey);
                 const files = await collectDatasetFiles(datasetKey, workspaceDir, cfg);
-                const retainedAssets = datasetKey === "library" ? (await loadRetainedLibraryManifest()).assets.length : undefined;
+                const retainedManifest = datasetKey === "library" ? await loadRetainedLibraryManifest() : undefined;
+                const retainedAssets = retainedManifest?.assets.length;
+                const retainedCapacity = datasetKey === "library" && retainedManifest
+                    ? summarizeRetainedCapacity(retainedManifest, cfg)
+                    : undefined;
                 const compactionManifest = datasetKey === "memory" ? await loadCompactionManifest() : undefined;
                 const compactionArtifacts = compactionManifest?.artifacts.length;
                 const llmCompactionArtifacts = compactionManifest?.artifacts.filter((artifact) => artifact.summaryMode === "llm-distilled").length;
@@ -2224,9 +2505,13 @@ const memoryCogneePlugin = {
                     files,
                     ranking: rankingStates[datasetKey],
                     retainedAssets,
+                    ...(retainedCapacity ? { retainedBytes: retainedCapacity.totalBytes } : {}),
                     compactionArtifacts,
                     llmCompactionArtifacts,
                 });
+                if (retainedCapacity) {
+                    lines.push(...buildRetainedCapacityLines(retainedCapacity).slice(1));
+                }
                 console.log(lines.join("\n"));
             });
             cognee
@@ -2283,6 +2568,7 @@ const memoryCogneePlugin = {
                     workspaceDir,
                     sourcePath: path,
                     title: opts.title,
+                    cfg,
                 });
                 const result = await syncDataset("library", workspaceDir, ctx.logger);
                 console.log(`[library] imported ${asset.virtualPath} (${result.added} added, ${result.updated} updated, ${result.deleted} deleted, ${result.errors} errors)`);
@@ -2295,14 +2581,19 @@ const memoryCogneePlugin = {
                 const target = (opts.dataset ?? "all").trim().toLowerCase();
                 if (target === "all" || target === "library") {
                     const retained = await auditRetainedAssets();
+                    const capacity = await getRetainedCapacitySummary();
                     console.log("[library] retained assets");
                     if (retained.length === 0) {
                         console.log("  (none)");
                     }
                     else {
                         for (const asset of retained) {
-                            console.log(`${asset.assetId}\t${asset.virtualPath}\tstorage=${asset.storageExists ? "ok" : "missing"}\tindexed=${asset.indexed ? "yes" : "no"}`);
+                            console.log(`${asset.assetId}\t${asset.virtualPath}\tsize=${formatBytes(asset.sizeBytes)}\tstorage=${asset.storageExists ? "ok" : "missing"}\tindexed=${asset.indexed ? "yes" : "no"}`);
                         }
+                    }
+                    console.log(`[library] retained capacity: ${capacity.assetCount} assets, ${formatBytes(capacity.totalBytes)} total`);
+                    for (const line of buildRetainedCapacityLines(capacity).slice(1)) {
+                        console.log(`[library] ${line.replace(/^Retained /, "retained ")}`);
                     }
                 }
                 if (target === "all" || target === "memory") {
@@ -2335,6 +2626,22 @@ const memoryCogneePlugin = {
                 console.log(`[library] rebuilt retained asset ${result.assetId} (${result.virtualPath}); ${result.sync.added} added, ${result.sync.updated} updated, ${result.sync.deleted} deleted`);
             });
             cognee
+                .command("retained-suggest")
+                .description("Suggest retained library assets to prune when capacity budgets or duplicates accumulate")
+                .option("--limit <n>", "Maximum suggestions", "10")
+                .action(async (opts) => {
+                await ensureDatasetLoaded("library");
+                const manifest = await loadRetainedLibraryManifest();
+                const suggestions = computeRetainedCleanupSuggestions(manifest, syncIndexes.library, cfg, Number.parseInt(opts.limit ?? "10", 10));
+                if (suggestions.length === 0) {
+                    console.log("[library] no retained cleanup suggestions");
+                    return;
+                }
+                for (const suggestion of suggestions) {
+                    console.log(`${suggestion.assetId}\t${suggestion.virtualPath}\tsize=${formatBytes(suggestion.sizeBytes)}\t${suggestion.reason}`);
+                }
+            });
+            cognee
                 .command("stats")
                 .description("Inspect ranking stats for a dataset")
                 .option("--dataset <dataset>", "Target dataset (memory|library)", "memory")
@@ -2349,9 +2656,11 @@ const memoryCogneePlugin = {
                     .map((file) => ({
                     path: file.path,
                     adjustedScore: adjustSearchScore({
+                        datasetKey,
                         baseScore: 0.25,
                         signals: rankingStates[datasetKey].entries[file.path] ?? defaultSignals(),
                         fileMtimeMs: file.mtimeMs,
+                        cfg,
                     }),
                     signals: rankingStates[datasetKey].entries[file.path] ?? defaultSignals(),
                 }))
@@ -2410,7 +2719,7 @@ const memoryCogneePlugin = {
                 .action(async (opts) => {
                 const files = await collectDatasetFiles("memory", workspaceDir, cfg);
                 const manifest = await loadCompactionManifest();
-                const suggestions = computeCompactSuggestions(files, manifest)
+                const suggestions = computeCompactSuggestions(files, manifest, cfg)
                     .slice(0, Number.parseInt(opts.limit ?? "10", 10));
                 if (suggestions.length === 0) {
                     console.log("[memory] no compaction suggestions");
@@ -2428,7 +2737,7 @@ const memoryCogneePlugin = {
                 .action(async (opts) => {
                 const files = await collectDatasetFiles("memory", workspaceDir, cfg);
                 const manifest = await loadCompactionManifest();
-                const suggestions = computeCompactSuggestions(files, manifest)
+                const suggestions = computeCompactSuggestions(files, manifest, cfg)
                     .slice(0, Number.parseInt(opts.limit ?? "5", 10));
                 if (suggestions.length === 0) {
                     console.log("[memory] no compaction suggestions to apply");
@@ -2503,7 +2812,7 @@ const memoryCogneePlugin = {
                 const datasetKey = resolveDatasetKey(opts.dataset);
                 await ensureDatasetLoaded(datasetKey);
                 const files = await collectDatasetFiles(datasetKey, workspaceDir, cfg);
-                const suggestions = computeCleanupSuggestions(files, rankingStates[datasetKey])
+                const suggestions = computeCleanupSuggestions(datasetKey, files, rankingStates[datasetKey], cfg)
                     .slice(0, Number.parseInt(opts.limit ?? "10", 10));
                 if (suggestions.length === 0) {
                     console.log(`[${datasetKey}] no cleanup suggestions`);
@@ -2522,7 +2831,7 @@ const memoryCogneePlugin = {
                 const datasetKey = resolveDatasetKey(opts.dataset);
                 await ensureDatasetLoaded(datasetKey);
                 const files = await collectDatasetFiles(datasetKey, workspaceDir, cfg);
-                const suggestions = computeCleanupSuggestions(files, rankingStates[datasetKey])
+                const suggestions = computeCleanupSuggestions(datasetKey, files, rankingStates[datasetKey], cfg)
                     .slice(0, Number.parseInt(opts.limit ?? "5", 10));
                 for (const suggestion of suggestions) {
                     applyDeprioritizeSignals(rankingStates[datasetKey], suggestion.path);
@@ -2541,10 +2850,10 @@ const memoryCogneePlugin = {
                         continue;
                     try {
                         const result = await syncDataset(datasetKey, workspaceDir, ctx.logger);
-                        ctx.logger.info?.(`cognee-openclaw: [${datasetKey}] auto-sync complete: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted, ${result.skipped} unchanged`);
+                        ctx.logger.info?.(`memory-cognee-revised: [${datasetKey}] auto-sync complete: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted, ${result.skipped} unchanged`);
                     }
                     catch (error) {
-                        ctx.logger.warn?.(`cognee-openclaw: [${datasetKey}] auto-sync failed: ${String(error)}`);
+                        ctx.logger.warn?.(`memory-cognee-revised: [${datasetKey}] auto-sync failed: ${String(error)}`);
                     }
                 }
             },
@@ -2560,20 +2869,20 @@ const memoryCogneePlugin = {
                     await refreshDatasetLoaded(datasetKey);
                     const result = await syncDataset(datasetKey, workspaceDir, api.logger, { changedOnly: true });
                     if (result.added || result.updated || result.deleted) {
-                        api.logger.info?.(`cognee-openclaw: [${datasetKey}] post-agent sync: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted`);
+                        api.logger.info?.(`memory-cognee-revised: [${datasetKey}] post-agent sync: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted`);
                     }
                 }
                 catch (error) {
-                    api.logger.warn?.(`cognee-openclaw: [${datasetKey}] post-agent sync failed: ${String(error)}`);
+                    api.logger.warn?.(`memory-cognee-revised: [${datasetKey}] post-agent sync failed: ${String(error)}`);
                 }
             }
         });
         if (cfg.datasets.memory.autoRecall || cfg.datasets.library.autoRecall) {
-            api.logger.info?.("cognee-openclaw: autoRecall flags are treated as metadata only; this plugin manages memory datasets and does not inject runtime context.");
+            api.logger.info?.("memory-cognee-revised: autoRecall flags are treated as metadata only; this plugin manages memory datasets and does not inject runtime context.");
         }
     },
 };
 export default memoryCogneePlugin;
 export { CogneeClient, syncFiles };
-export { resolveConfig, resolveDatasetKey, datasetSyncIndexPath, datasetRankingPath, loadDatasetSyncIndex, saveDatasetSyncIndex, loadRankingState, saveRankingState, discoverConfiguredAgentWorkspaces, collectMemoryDatasetFiles, collectLibraryDatasetFiles, collectDatasetFiles, librarySourceVirtualBase, adjustSearchScore, applyDeprioritizeSignals, computeCleanupSuggestions, extractVirtualPathFromSearchResult, };
+export { resolveConfig, resolveDatasetKey, datasetSyncIndexPath, datasetRankingPath, loadDatasetSyncIndex, saveDatasetSyncIndex, loadRankingState, saveRankingState, discoverConfiguredAgentWorkspaces, collectMemoryDatasetFiles, collectLibraryDatasetFiles, collectDatasetFiles, librarySourceVirtualBase, adjustSearchScore, applyDeprioritizeSignals, computeCleanupSuggestions, classifyCompactionProfile, buildCompactionSystemPrompt, summarizeRetainedCapacity, buildRetainedCapacityLines, computeRetainedCleanupSuggestions, computeCompactSuggestions, importRetainedLibraryAsset, extractVirtualPathFromSearchResult, };
 //# sourceMappingURL=index.js.map

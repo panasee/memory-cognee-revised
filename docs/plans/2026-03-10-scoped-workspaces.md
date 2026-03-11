@@ -59,7 +59,7 @@ Colon `:` is the separator. Scope names are case-sensitive, no nested colons.
 ```yaml
 plugins:
   entries:
-    cognee-openclaw:
+    memory-cognee-revised:
       enabled: true
       config:
         baseUrl: "http://localhost:8000"
@@ -687,9 +687,9 @@ if (cfg.autoIndex) {
         // Legacy mode — unchanged
         try {
           const result = await runSync(resolvedWorkspaceDir, ctx.logger);
-          ctx.logger.info?.(`cognee-openclaw: auto-sync complete: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted, ${result.skipped} unchanged`);
+          ctx.logger.info?.(`memory-cognee-revised: auto-sync complete: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted, ${result.skipped} unchanged`);
         } catch (error) {
-          ctx.logger.warn?.(`cognee-openclaw: auto-sync failed: ${String(error)}`);
+          ctx.logger.warn?.(`memory-cognee-revised: auto-sync failed: ${String(error)}`);
         }
         return;
       }
@@ -708,11 +708,11 @@ if (cfg.autoIndex) {
 
           const files = await collectScopeMemoryFiles(resolvedWorkspaceDir, scope);
           if (files.length === 0) {
-            ctx.logger.info?.(`cognee-openclaw: [${scope.name}] no memory files found`);
+            ctx.logger.info?.(`memory-cognee-revised: [${scope.name}] no memory files found`);
             continue;
           }
 
-          ctx.logger.info?.(`cognee-openclaw: [${scope.name}] found ${files.length} file(s), syncing...`);
+          ctx.logger.info?.(`memory-cognee-revised: [${scope.name}] found ${files.length} file(s), syncing...`);
 
           const result = await syncFiles(
             client, files, files, scope.syncIndex, cfg, ctx.logger,
@@ -725,9 +725,9 @@ if (cfg.autoIndex) {
             await saveDatasetState(dsState);
           }
 
-          ctx.logger.info?.(`cognee-openclaw: [${scope.name}] sync complete: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted, ${result.skipped} unchanged`);
+          ctx.logger.info?.(`memory-cognee-revised: [${scope.name}] sync complete: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted, ${result.skipped} unchanged`);
         } catch (error) {
-          ctx.logger.warn?.(`cognee-openclaw: [${scope.name}] auto-sync failed: ${String(error)}`);
+          ctx.logger.warn?.(`memory-cognee-revised: [${scope.name}] auto-sync failed: ${String(error)}`);
         }
       }
     },
@@ -764,14 +764,14 @@ if (cfg.autoRecall) {
     await stateReady;
 
     if (!event.prompt || event.prompt.length < 5) {
-      api.logger.debug?.("cognee-openclaw: skipping recall (prompt too short)");
+      api.logger.debug?.("memory-cognee-revised: skipping recall (prompt too short)");
       return;
     }
 
     if (!isScoped) {
       // Legacy mode — unchanged (existing code)
       if (!datasetId) {
-        api.logger.debug?.("cognee-openclaw: skipping recall (no datasetId)");
+        api.logger.debug?.("memory-cognee-revised: skipping recall (no datasetId)");
         return;
       }
       // ... existing search + inject logic ...
@@ -786,7 +786,7 @@ if (cfg.autoRecall) {
       .filter((id): id is string => !!id);
 
     if (datasetIds.length === 0) {
-      api.logger.debug?.(`cognee-openclaw: skipping recall (no indexed scopes for agent ${agentId ?? "unknown"})`);
+      api.logger.debug?.(`memory-cognee-revised: skipping recall (no indexed scopes for agent ${agentId ?? "unknown"})`);
       return;
     }
 
@@ -804,7 +804,7 @@ if (cfg.autoRecall) {
         .slice(0, cfg.maxResults);
 
       if (filtered.length === 0) {
-        api.logger.debug?.("cognee-openclaw: search returned no results above minScore");
+        api.logger.debug?.("memory-cognee-revised: search returned no results above minScore");
         return;
       }
 
@@ -816,14 +816,14 @@ if (cfg.autoRecall) {
 
       const scopeNames = permitted.map((s) => s.name).join(", ");
       api.logger.info?.(
-        `cognee-openclaw: injecting ${filtered.length} memories from [${scopeNames}] for agent ${agentId ?? "unknown"}`,
+        `memory-cognee-revised: injecting ${filtered.length} memories from [${scopeNames}] for agent ${agentId ?? "unknown"}`,
       );
 
       return {
         prependContext: `<cognee_memories>\nRelevant memories (scopes: ${scopeNames}):\n${payload}\n</cognee_memories>`,
       };
     } catch (error) {
-      api.logger.warn?.(`cognee-openclaw: recall failed: ${String(error)}`);
+      api.logger.warn?.(`memory-cognee-revised: recall failed: ${String(error)}`);
     }
   });
 }
@@ -889,7 +889,7 @@ if (cfg.autoIndex) {
         if (changedFiles.length === 0 && !hasDeleted) continue;
 
         api.logger.info?.(
-          `cognee-openclaw: [${scope.name}] detected ${changedFiles.length} changed file(s)${hasDeleted ? " + deletions" : ""}, syncing...`,
+          `memory-cognee-revised: [${scope.name}] detected ${changedFiles.length} changed file(s)${hasDeleted ? " + deletions" : ""}, syncing...`,
         );
 
         const result = await syncFiles(
@@ -904,10 +904,10 @@ if (cfg.autoIndex) {
         }
 
         api.logger.info?.(
-          `cognee-openclaw: [${scope.name}] post-agent sync: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted`,
+          `memory-cognee-revised: [${scope.name}] post-agent sync: ${result.added} added, ${result.updated} updated, ${result.deleted} deleted`,
         );
       } catch (error) {
-        api.logger.warn?.(`cognee-openclaw: [${scope.name}] post-agent sync failed: ${String(error)}`);
+        api.logger.warn?.(`memory-cognee-revised: [${scope.name}] post-agent sync failed: ${String(error)}`);
       }
     }
   });

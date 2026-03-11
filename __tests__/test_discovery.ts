@@ -1,9 +1,11 @@
 import {
   collectLibraryDatasetFiles,
   collectMemoryDatasetFiles,
+  computeCompactSuggestions,
   computeCleanupSuggestions,
   discoverConfiguredAgentWorkspaces,
   librarySourceVirtualBase,
+  resolveConfig,
 } from "../index";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
@@ -128,6 +130,7 @@ describe("workspace aggregation + library discovery", () => {
 
   it("produces cleanup suggestions from stale ranking signals", () => {
     const suggestions = computeCleanupSuggestions(
+      "memory",
       [
         {
           path: "main/memory/stale.md",
@@ -148,10 +151,55 @@ describe("workspace aggregation + library discovery", () => {
           },
         },
       },
+      resolveConfig({}),
       100 * 86_400_000,
     );
 
     expect(suggestions).toHaveLength(1);
     expect(suggestions[0].path).toBe("main/memory/stale.md");
+  });
+
+  it("keeps library cleanup tolerance looser than memory", () => {
+    const file = {
+      path: `${librarySourceVirtualBase("/srv/reference")}/paper.md`,
+      absPath: "/srv/reference/paper.md",
+      content: "paper",
+      hash: "h1",
+      mtimeMs: 120 * 86_400_000,
+    };
+    const ranking = {
+      entries: {
+        [file.path]: { recallCount: 0, searchHitCount: 0, forgetCount: 0 },
+      },
+    };
+    const cfg = resolveConfig({});
+
+    const memorySuggestions = computeCleanupSuggestions("memory", [file], ranking, cfg, 500 * 86_400_000);
+    const librarySuggestions = computeCleanupSuggestions("library", [file], ranking, cfg, 500 * 86_400_000);
+
+    expect(memorySuggestions).toHaveLength(1);
+    expect(librarySuggestions).toHaveLength(1);
+    expect(memorySuggestions[0].adjustedScore).toBeLessThan(librarySuggestions[0].adjustedScore);
+  });
+
+  it("routes reference-style compaction suggestions toward retained import", () => {
+    const cfg = resolveConfig({});
+    const suggestions = computeCompactSuggestions(
+      [
+        {
+          path: "main/memory/reference/topology.md",
+          absPath: "/workspace/main/memory/reference/topology.md",
+          content: "reference note",
+          hash: "href",
+          mtimeMs: 40 * 86_400_000,
+        },
+      ],
+      { artifacts: [] },
+      cfg,
+      80 * 86_400_000,
+    );
+
+    expect(suggestions).toHaveLength(1);
+    expect(suggestions[0]?.reason).toContain("retained library import");
   });
 });

@@ -100,18 +100,44 @@ describe("ranking signals", () => {
     });
 
     const boosted = adjustSearchScore({
+      datasetKey: "memory",
       baseScore: 0.6,
       signals: { recallCount: 3, searchHitCount: 5, forgetCount: 0, lastHitAt: 2_000 },
       fileMtimeMs: 2_000,
       now: 2_500,
+      cfg: resolveConfig({}),
     });
     const deprioritized = adjustSearchScore({
+      datasetKey: "memory",
       baseScore: 0.6,
       signals: ranking.entries["main/memory/stale.md"],
       fileMtimeMs: 2_000,
       now: 2_500,
+      cfg: resolveConfig({}),
     });
 
     expect(boosted).toBeGreaterThan(deprioritized);
+  });
+
+  it("decays library ranking more slowly than memory", () => {
+    const cfg = resolveConfig({});
+    const memoryScore = adjustSearchScore({
+      datasetKey: "memory",
+      baseScore: 0.5,
+      signals: { recallCount: 0, searchHitCount: 0, forgetCount: 0 },
+      fileMtimeMs: 0,
+      now: 120 * 86_400_000,
+      cfg,
+    });
+    const libraryScore = adjustSearchScore({
+      datasetKey: "library",
+      baseScore: 0.5,
+      signals: { recallCount: 0, searchHitCount: 0, forgetCount: 0 },
+      fileMtimeMs: 0,
+      now: 120 * 86_400_000,
+      cfg,
+    });
+
+    expect(libraryScore).toBeGreaterThan(memoryScore);
   });
 });

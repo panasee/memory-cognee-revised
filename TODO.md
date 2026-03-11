@@ -1,6 +1,6 @@
 # TODO
 
-This TODO describes the incremental features that must be added on top of the original `@cognee/cognee-openclaw` plugin.
+This TODO describes the incremental features that must be added on top of the original `memory-cognee-revised` plugin baseline.
 
 Use the original plugin as the baseline and implement only the additional capabilities listed here.
 
@@ -232,4 +232,3 @@ Add tests for:
 - ranking signal behavior
 - deprioritize behavior
 - purge-critical behavior
-

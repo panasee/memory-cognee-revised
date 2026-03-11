@@ -39,6 +39,10 @@ type CogneePluginConfig = {
     summaryModel?: string;
     summaryProvider?: string;
     summaryMaxTokens?: number;
+    retainedAssetWarnBytes?: number;
+    retainedAssetWarnCount?: number;
+    retainedAssetMaxBytes?: number;
+    retainedAssetMaxCount?: number;
     datasets?: Partial<Record<DatasetKey, DatasetProfileConfig>>;
 };
 type ResolvedCogneePluginConfig = {
@@ -60,6 +64,20 @@ type ResolvedCogneePluginConfig = {
     summaryModel: string;
     summaryProvider: string;
     summaryMaxTokens: number;
+    retainedAssetWarnBytes: number;
+    retainedAssetWarnCount: number;
+    retainedAssetMaxBytes?: number;
+    retainedAssetMaxCount?: number;
+    rankingPolicies: Record<DatasetKey, {
+        dailyDecay: number;
+        maxDecay: number;
+        staleDays: number;
+        deprioritizedGraceDays: number;
+    }>;
+    compactionPolicies: Record<CompactionProfile, {
+        defaultDeleteSource: boolean;
+        strategy: "distill-delete" | "distill-keep" | "retained-import" | "skip";
+    }>;
     datasets: Record<DatasetKey, ResolvedDatasetProfile>;
 };
 type CogneeSearchResult = {
@@ -116,20 +134,73 @@ type WorkspaceBinding = {
     workspaceDir: string;
     prefix: string;
 };
+type RetainedLibraryAsset = {
+    assetId: string;
+    title: string;
+    originalPath?: string;
+    importedAt: string;
+    contentHash: string;
+    sizeBytes?: number;
+    storagePath: string;
+    virtualPath: string;
+};
+type RetainedLibraryManifest = {
+    assets: RetainedLibraryAsset[];
+};
+type CompactionArtifact = {
+    artifactId: string;
+    sourcePath: string;
+    sourceHash: string;
+    createdAt: string;
+    replacementPath: string;
+    replacementKind: "distilled-memory";
+    status: "ready" | "applied";
+    summaryMode?: "llm-distilled" | "preserved-copy";
+    summaryModelRef?: string;
+    lastRebuiltAt?: string;
+};
+type CompactionManifest = {
+    artifacts: CompactionArtifact[];
+};
 type CleanupSuggestion = {
     path: string;
     adjustedScore: number;
     reason: string;
 };
+type CompactSuggestion = {
+    path: string;
+    reason: string;
+};
+type CompactionProfile = "daily-log" | "worklog" | "reference-note" | "general";
+type RetainedCapacitySummary = {
+    assetCount: number;
+    totalBytes: number;
+    warnCountExceeded: boolean;
+    warnBytesExceeded: boolean;
+    maxCountExceeded: boolean;
+    maxBytesExceeded: boolean;
+};
+type RetainedCleanupSuggestion = {
+    assetId: string;
+    virtualPath: string;
+    title: string;
+    sizeBytes: number;
+    reason: string;
+};
+declare function classifyCompactionProfile(file: MemoryFile): CompactionProfile;
+declare function buildCompactionSystemPrompt(profile: CompactionProfile): string;
+declare function computeCompactSuggestions(files: MemoryFile[], manifest: CompactionManifest, cfg: Pick<ResolvedCogneePluginConfig, "compactionPolicies">, now?: number): CompactSuggestion[];
 declare function resolveDatasetKey(input?: string): DatasetKey;
 declare function datasetSyncIndexPath(datasetKey: DatasetKey): string;
 declare function datasetRankingPath(datasetKey: DatasetKey): string;
 declare function applyDeprioritizeSignals(state: RankingState, path: string, now?: number): RankingSignals;
 declare function adjustSearchScore(params: {
+    datasetKey: DatasetKey;
     baseScore: number;
     signals?: RankingSignals;
     fileMtimeMs?: number;
     now?: number;
+    cfg: Pick<ResolvedCogneePluginConfig, "rankingPolicies">;
 }): number;
 declare function extractVirtualPathFromSearchResult(result: CogneeSearchResult): string | undefined;
 declare function resolveConfig(rawConfig: unknown): ResolvedCogneePluginConfig;
@@ -137,6 +208,9 @@ declare function loadDatasetSyncIndex(datasetKey: DatasetKey): Promise<SyncIndex
 declare function saveDatasetSyncIndex(datasetKey: DatasetKey, index: SyncIndex): Promise<void>;
 declare function loadRankingState(datasetKey: DatasetKey): Promise<RankingState>;
 declare function saveRankingState(datasetKey: DatasetKey, state: RankingState): Promise<void>;
+declare function summarizeRetainedCapacity(manifest: RetainedLibraryManifest, cfg: Pick<ResolvedCogneePluginConfig, "retainedAssetWarnBytes" | "retainedAssetWarnCount" | "retainedAssetMaxBytes" | "retainedAssetMaxCount">): RetainedCapacitySummary;
+declare function buildRetainedCapacityLines(summary: RetainedCapacitySummary): string[];
+declare function computeRetainedCleanupSuggestions(manifest: RetainedLibraryManifest, syncIndex: SyncIndex, cfg: Pick<ResolvedCogneePluginConfig, "retainedAssetWarnBytes" | "retainedAssetWarnCount" | "retainedAssetMaxBytes" | "retainedAssetMaxCount">, limit?: number): RetainedCleanupSuggestion[];
 declare function discoverConfiguredAgentWorkspaces(): Promise<WorkspaceBinding[]>;
 declare function librarySourceVirtualBase(rootPath: string): string;
 declare function collectLibraryDatasetFiles(workspaceDir: string, profile: ResolvedDatasetProfile): Promise<MemoryFile[]>;
@@ -206,7 +280,13 @@ declare function syncFiles(client: CogneeClient, changedFiles: MemoryFile[], ful
 }, saveFn?: (index: SyncIndex) => Promise<void>): Promise<SyncResult & {
     datasetId?: string;
 }>;
-declare function computeCleanupSuggestions(files: MemoryFile[], ranking: RankingState, now?: number): CleanupSuggestion[];
+declare function computeCleanupSuggestions(datasetKey: DatasetKey, files: MemoryFile[], ranking: RankingState, cfg: Pick<ResolvedCogneePluginConfig, "rankingPolicies">, now?: number): CleanupSuggestion[];
+declare function importRetainedLibraryAsset(params: {
+    workspaceDir: string;
+    sourcePath: string;
+    title?: string;
+    cfg: Pick<ResolvedCogneePluginConfig, "retainedAssetWarnBytes" | "retainedAssetWarnCount" | "retainedAssetMaxBytes" | "retainedAssetMaxCount">;
+}): Promise<RetainedLibraryAsset>;
 declare const memoryCogneePlugin: {
     id: string;
     name: string;
@@ -216,5 +296,5 @@ declare const memoryCogneePlugin: {
 };
 export default memoryCogneePlugin;
 export { CogneeClient, syncFiles };
-export { resolveConfig, resolveDatasetKey, datasetSyncIndexPath, datasetRankingPath, loadDatasetSyncIndex, saveDatasetSyncIndex, loadRankingState, saveRankingState, discoverConfiguredAgentWorkspaces, collectMemoryDatasetFiles, collectLibraryDatasetFiles, collectDatasetFiles, librarySourceVirtualBase, adjustSearchScore, applyDeprioritizeSignals, computeCleanupSuggestions, extractVirtualPathFromSearchResult, };
-export type { CogneeDeleteMode, CogneePluginConfig, DatasetKey, DatasetProfileConfig, ResolvedDatasetProfile, ResolvedCogneePluginConfig, MemoryFile, SyncIndex, SyncResult, RankingSignals, RankingState, DatasetSyncConfig, WorkspaceBinding, CleanupSuggestion, };
+export { resolveConfig, resolveDatasetKey, datasetSyncIndexPath, datasetRankingPath, loadDatasetSyncIndex, saveDatasetSyncIndex, loadRankingState, saveRankingState, discoverConfiguredAgentWorkspaces, collectMemoryDatasetFiles, collectLibraryDatasetFiles, collectDatasetFiles, librarySourceVirtualBase, adjustSearchScore, applyDeprioritizeSignals, computeCleanupSuggestions, classifyCompactionProfile, buildCompactionSystemPrompt, summarizeRetainedCapacity, buildRetainedCapacityLines, computeRetainedCleanupSuggestions, computeCompactSuggestions, importRetainedLibraryAsset, extractVirtualPathFromSearchResult, };
+export type { CogneeDeleteMode, CogneePluginConfig, DatasetKey, DatasetProfileConfig, ResolvedDatasetProfile, ResolvedCogneePluginConfig, MemoryFile, SyncIndex, SyncResult, RankingSignals, RankingState, DatasetSyncConfig, WorkspaceBinding, CleanupSuggestion, RetainedCapacitySummary, RetainedCleanupSuggestion, };

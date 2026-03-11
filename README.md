@@ -1,4 +1,4 @@
-# @cognee/cognee-openclaw
+# memory-cognee-revised
 
 Cognee-backed OpenClaw memory plugin for file-backed `memory` and `library` datasets.
 
@@ -10,6 +10,12 @@ This plugin is a memory manager, not a context engine:
 - it does **not** implement context orchestration
 
 This is the intended shape for pairing with `lossless-claw`: `lossless-claw` owns runtime context assembly and session compaction, while this plugin provides external file-backed memory through `memory_search` / `memory_get` / `memory_store` / `memory_forget`.
+
+Academic-friendly defaults are now baked in:
+
+- `library` ranking decays more slowly than `memory`
+- `library` cleanup tolerates much older untouched material than `memory`
+- `reference-note` sources are treated as retained-library candidates, not normal compaction targets
 
 ## Dataset model
 
@@ -40,6 +46,13 @@ Virtual paths are stable:
 
 For transient raw notes, use `openclaw cognee compact-memory <path>` to create a durable tool-managed memory artifact before deleting the source file.
 By default the plugin will try to distill a true long-term summary with OpenClaw's configured primary model; if no runtime model can be resolved it falls back to a preserved-copy artifact and records the fallback reason in the note metadata.
+Compaction is source-aware: daily logs, worklogs, and reference notes use different distillation prompts so durable memory stays compact instead of turning into a prettified raw dump.
+Default compaction actions now differ by source type:
+
+- `daily-log`: distill, then delete source by default
+- `worklog`: distill, keep source by default
+- `reference-note`: do not compact; move it to retained `library` with `import-library`
+- `general`: distill, keep source by default
 
 ## Library dataset layout
 
@@ -52,12 +65,18 @@ Mirror sources become stable virtual roots under `sources/<name>-<hash>/...`.
 
 Retained imports are copied into plugin-managed storage and exposed under stable virtual paths like `retained/<asset-id>/<name>.md`, so they can remain searchable after the original source file is removed.
 
+Retained library imports now also have capacity governance:
+
+- soft warnings for total retained bytes and asset count
+- optional hard import limits for bytes and count
+- cleanup suggestions for duplicates, unindexed assets, and old retained assets when over budget
+
 ## Configuration
 
 ```yaml
 plugins:
   entries:
-    cognee-openclaw:
+    memory-cognee-revised:
       enabled: true
       config:
         baseUrl: "http://localhost:8000"
@@ -68,6 +87,10 @@ plugins:
         summaryModel: "openai-codex/gpt-5.3-codex"
         summaryProvider: "openai-codex"
         summaryMaxTokens: 900
+        retainedAssetWarnBytes: 536870912
+        retainedAssetWarnCount: 500
+        retainedAssetMaxBytes: 1073741824
+        retainedAssetMaxCount: 1000
         datasets:
           memory:
             datasetName: "project-memory"
@@ -93,6 +116,7 @@ openclaw cognee index --dataset memory
 openclaw cognee index --dataset library
 openclaw cognee import-library ./reference/guide.md
 openclaw cognee assets-audit
+openclaw cognee retained-suggest
 openclaw cognee retained-rebuild asset_1234567890abcdef
 openclaw cognee retained-delete asset_1234567890abcdef
 openclaw cognee compact-suggest
@@ -152,6 +176,10 @@ For backward compatibility, these top-level fields are still accepted and mapped
 - `summaryModel`
 - `summaryProvider`
 - `summaryMaxTokens`
+- `retainedAssetWarnBytes`
+- `retainedAssetWarnCount`
+- `retainedAssetMaxBytes`
+- `retainedAssetMaxCount`
 
 `autoRecall` remains metadata only. This plugin still does not inject prompt context.
 
