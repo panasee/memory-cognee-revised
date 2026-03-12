@@ -7,6 +7,70 @@ Use the original plugin as the baseline and implement only the additional capabi
 Sections are kept for implementation history.
 When a section is already landed, it is marked with an explicit status instead of being silently removed.
 
+## Active Plan: `qdrant-neo4j-combo`
+
+Status: planned
+
+This branch is for the Qdrant/Neo4j retrieval upgrade work.
+
+Scope for this branch:
+
+- keep the landed fallback telemetry work as-is; do not expand debug text into normal retrieval output
+- implement richer Cognee search surface:
+  - extend `CogneeSearchType`
+  - add optional search parameters needed for backend-aware evaluation and routing
+- add a conservative query router:
+  - exact/path/title/tag queries -> chunk/lexical-oriented mode
+  - relation/summary/why/how queries -> graph-oriented mode
+  - `memory` defaults more graph-oriented
+  - `library` defaults more lexical/document-oriented
+  - explicit user-selected mode always wins over auto-routing
+- strengthen metadata use without overfitting to a single backend:
+  - reuse unified semantic details for rerank and post-filter
+  - prefer plugin-side filtering first
+  - only pass backend-native filters when the current Cognee API clearly supports them
+- add tests for:
+  - expanded search config parsing
+  - query routing decisions
+  - explicit-mode override behavior
+  - metadata-driven rerank/post-filter behavior
+
+Implementation order for this branch:
+
+1. extend search config/schema/client request surface
+2. add query routing in `searchDataset`
+3. connect semantic metadata to rerank/post-filter
+4. add/update tests
+
+### Technical notes from current backend docs
+
+Validated against official docs on 2026-03-13:
+
+- Cognee HTTP search is the plugin contract, not raw Qdrant/Neo4j APIs. Use the current HTTP API surface as the baseline for implementation: documented body fields include `searchType`, `systemPrompt`, `datasetIds`, `nodeName`, `topK`, `onlyContext`, and `verbose`. Expand plugin config/client calls against that surface first.
+- Extend `CogneeSearchType` from the HTTP search docs, not from older local assumptions. The documented HTTP modes now include at least: `SUMMARIES`, `CHUNKS`, `RAG_COMPLETION`, `TRIPLET_COMPLETION`, `GRAPH_COMPLETION`, `GRAPH_SUMMARY_COMPLETION`, `CYPHER`, `NATURAL_LANGUAGE`, `GRAPH_COMPLETION_COT`, `GRAPH_COMPLETION_CONTEXT_EXTENSION`, `FEELING_LUCKY`, `TEMPORAL`, `CODING_RULES`, `CHUNKS_LEXICAL`.
+- Cognee session-based search is documented in core concepts for `GRAPH_COMPLETION`, `RAG_COMPLETION`, and `TRIPLET_COMPLETION`, but the current HTTP API page does not clearly document a `session_id` request field. Treat session continuity as opt-in/experimental and fail soft if the deployed endpoint rejects it.
+- Qdrant-specific retrieval wins are mostly deployment-side behind Cognee, not direct plugin knobs. Relevant official Qdrant features are hybrid dense+sparse fusion (`RRF` / `DBSF`), payload filtering and payload indexes, multivectors, quantization, and tenant indexing. Because Cognee uses a community-maintained Qdrant adapter, the plugin must assume these are not directly reachable unless Cognee explicitly exposes them.
+- Neo4j-specific retrieval wins are also mostly deployment-side behind Cognee. Relevant official Neo4j features are vector indexes, the `SEARCH` clause with index-aware filtering, and full-text indexes/analyzers. In plugin code, treat these as reasons to prefer graph-oriented Cognee modes for relation-heavy `memory` queries, not as direct database calls.
+- Routing implication for the first implementation:
+  - `memory`: prefer graph-oriented modes for relation/correction/supersession/why/how queries; use session continuity only for modes that officially support it.
+  - `library`: prefer document/chunk/lexical modes for exact title/path/topic/source queries; do not force graph expansion for straightforward evidence lookup.
+- Evaluation implication: backend/provider switches and embedding-dimension changes require prune/reindex before comparing quality. Keep the operator workflow explicit for prune + re-cognify when validating Qdrant/Neo4j behavior.
+
+Reference docs:
+
+- [Cognee HTTP Search API](https://docs.cognee.ai/api-reference/search/search)
+- [Cognee Search Basics](https://docs.cognee.ai/core-concepts/search)
+- [Cognee Sessions And Caching](https://docs.cognee.ai/core-concepts/sessions-and-caching)
+- [Cognee Qdrant Adapter](https://docs.cognee.ai/setup-configuration/community-maintained/qdrant)
+- [Cognee Graph Store Integration Notes](https://docs.cognee.ai/contributing/adding-providers/graph-db/graph-database-integration)
+- [Qdrant Hybrid Queries](https://qdrant.tech/documentation/concepts/hybrid-queries/)
+- [Qdrant Indexing](https://qdrant.tech/documentation/concepts/indexing/)
+- [Qdrant Vectors And Multivectors](https://qdrant.tech/documentation/concepts/vectors/)
+- [Qdrant Quantization](https://qdrant.tech/documentation/guides/quantization/)
+- [Qdrant Multitenancy](https://qdrant.tech/documentation/guides/multiple-partitions/)
+- [Neo4j Vector Indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/)
+- [Neo4j Full-Text Indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/full-text-indexes/)
+
 ## 1. Add Fixed Dataset Profiles
 
 Status: completed
