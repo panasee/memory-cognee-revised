@@ -138,6 +138,23 @@
               "autoRecall": {
                 "type": "boolean",
                 "description": "Compatibility metadata only. This plugin does not inject runtime context."
+              },
+              "searchType": {
+                "type": "string",
+                "enum": ["GRAPH_COMPLETION", "CHUNKS", "SUMMARIES"],
+                "description": "Optional dataset-specific Cognee search mode for memory. Falls back to global searchType."
+              },
+              "searchPrompt": {
+                "type": "string",
+                "description": "Optional dataset-specific system prompt sent to Cognee search for memory."
+              },
+              "maxTokens": {
+                "type": "number",
+                "description": "Optional dataset-specific token cap passed to Cognee search for memory."
+              },
+              "ingestMode": {
+                "type": "string",
+                "description": "Optional dataset-specific ingestion profile for memory (default: distilled-note-first). This is advisory and does not require a rigid content type."
               }
             }
           },
@@ -165,6 +182,23 @@
               "autoRecall": {
                 "type": "boolean",
                 "description": "Compatibility metadata only. This plugin does not inject runtime context."
+              },
+              "searchType": {
+                "type": "string",
+                "enum": ["GRAPH_COMPLETION", "CHUNKS", "SUMMARIES"],
+                "description": "Optional dataset-specific Cognee search mode for library. Falls back to global searchType."
+              },
+              "searchPrompt": {
+                "type": "string",
+                "description": "Optional dataset-specific system prompt sent to Cognee search for library."
+              },
+              "maxTokens": {
+                "type": "number",
+                "description": "Optional dataset-specific token cap passed to Cognee search for library."
+              },
+              "ingestMode": {
+                "type": "string",
+                "description": "Optional dataset-specific ingestion profile for library (default: document-graph-first). This is advisory and does not require a rigid document taxonomy."
               }
             }
           }

@@ -97,6 +97,10 @@ plugins:
             autoIndex: true
             autoCognify: true
             autoRecall: true
+            searchType: "GRAPH_COMPLETION"
+            searchPrompt: "Prefer durable internal knowledge and reusable procedures."
+            maxTokens: 384
+            ingestMode: "distilled-note-first"
           library:
             datasetName: "project-library"
             paths:
@@ -105,9 +109,16 @@ plugins:
             autoIndex: false
             autoCognify: false
             autoRecall: false
+            searchType: "GRAPH_COMPLETION"
+            searchPrompt: "Prefer document-level external knowledge and source discovery."
+            maxTokens: 768
+            ingestMode: "document-graph-first"
 ```
 
 `autoRecall` is accepted as dataset metadata for compatibility, but this plugin still does not inject prompt context.
+
+Dataset-specific search and ingest settings are optional.
+If they are omitted, each dataset falls back to global defaults.
 
 ## CLI
 
@@ -146,6 +157,23 @@ The plugin registers dataset-aware versions of:
 
 All default to `dataset=memory`. `library` must be selected explicitly.
 
+`memory_search.details` and `memory_get.details` now expose semantic metadata when it can be inferred:
+
+- `title`
+- `kind`
+- `topics`
+- `originAgent` for `memory`
+- `sourceType` when supplied in frontmatter
+- `sourcePath`, `createdAt`, `derivedFrom`, `corrects`, `correctionOf`, `supersedes`, and `supersededBy` for `memory` when supplied in frontmatter
+- `storageType`, `originalPath`, `retainedAssetId`, and `importedAt` for `library` when provenance exists
+- `url`, `domain`, `authors`, and `publisher` for `library` when supplied in frontmatter
+
+For `memory` search results, the plugin also surfaces correction-chain visibility cues:
+
+- `relations` groups weak relation fields under one object
+- `displayFlags` highlights cases like `correction-related`, `superseded`, and `superseding`
+- entries with `supersededBy` are lightly downranked so newer replacements are less likely to sit behind stale memory
+
 Legacy compatibility that is still preserved:
 
 - `memory_search` still accepts `scope`, but ignores it.
@@ -159,6 +187,64 @@ Legacy compatibility that is still preserved:
 - `delete` for tool-managed notes only
 - `deprioritize`
 - `purge-critical`
+
+## Frontmatter Overrides
+
+Files may include optional markdown frontmatter.
+These fields are advisory overrides, not required schema.
+
+Example:
+
+```md
+---
+title: Control Notes
+kind: procedure
+topics: control, optimization
+source_type: personal-note
+---
+
+Body text...
+```
+
+Supported override behavior:
+
+- `title`: overrides inferred title
+- `kind`: overrides inferred knowledge kind
+- `topics`: preferred topic list
+- `tags` / `keywords`: used only when `topics` is absent
+- `source_type`: optional semantic source label chosen by the author
+- `source_path`: optional memory-side source reference
+- `created_at`: optional authored creation timestamp
+- `derived_from`: optional upstream memory/source references
+- `corrects`: optional corrected-memory references
+- `correction_of`: optional explicit correction target
+- `supersedes`: optional replaced-memory references
+- `superseded_by`: optional replacement-memory references
+- `url`: optional library/source URL
+- `domain`: optional library/source domain label
+- `authors`: optional author list
+- `publisher`: optional publisher/source-organization label
+
+Notes:
+
+- missing fields are fine; the plugin falls back to inference
+- `source_type` is semantic and user-defined
+- `storageType` is separate provenance managed by the plugin (`mirror` or `retained`)
+- `library` is not limited to academic papers; it may also contain personal knowledge notes, references, manuals, or other document-like source material
+- `memory` is not limited to distilled summaries; it may still contain curated operational notes, policies, and other durable handwritten material
+
+## Payload Shape
+
+The plugin now serializes the two datasets differently before sending content to Cognee:
+
+- `memory`: favors durable internal knowledge metadata such as `originAgent`, `kind`, and compact knowledge summaries
+- `library`: favors source-oriented metadata such as `storageType`, `originalPath`, retained provenance, and compact knowledge summaries
+
+These are weakly structured payloads:
+
+- fields may be absent
+- frontmatter may override inferred semantics
+- the plugin does not require a rigid document type taxonomy
 
 ## Compatibility config
 

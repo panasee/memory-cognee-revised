@@ -555,11 +555,371 @@ function extractVirtualPathFromSearchResult(result) {
     }
     return undefined;
 }
+function sanitizeSearchError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.replace(/\s+/g, " ").trim().slice(0, 240);
+}
+function buildSearchWarningText(datasetKey, telemetry, hasResults) {
+    if (!telemetry.remoteError) {
+        return undefined;
+    }
+    if (hasResults) {
+        return `[${datasetKey}] warning: remote Cognee search failed; showing local fallback results`;
+    }
+    return `[${datasetKey}] warning: remote Cognee search failed; no local fallback results were found`;
+}
+function buildSearchDebugLines(telemetry) {
+    return [
+        "Search debug:",
+        `  remoteAttempted=${telemetry.remoteAttempted}`,
+        `  remoteUsed=${telemetry.remoteUsed}`,
+        `  remoteHitCount=${telemetry.remoteHitCount}`,
+        `  fallbackUsed=${telemetry.fallbackUsed}`,
+        `  fallbackHitCount=${telemetry.fallbackHitCount}`,
+        `  strictRemote=${telemetry.strictRemote}`,
+        ...(telemetry.remoteError ? [`  remoteError=${telemetry.remoteError}`] : []),
+    ];
+}
 function renderToolText(lines, details = {}) {
     return { content: [{ type: "text", text: lines.join("\n") }], details };
 }
-function buildMemoryData(file, datasetKey) {
-    return `# ${file.path}\n\n${file.content}\n\n---\nMetadata: ${JSON.stringify({ path: file.path, source: datasetKey })}`;
+function extractDelimitedValues(value) {
+    if (!value)
+        return [];
+    return value
+        .replace(/^\[|\]$/g, "")
+        .split(/[;,|]/)
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+}
+function compactMetadata(metadata) {
+    return Object.fromEntries(Object.entries(metadata).filter(([, value]) => {
+        if (value === undefined || value === null)
+            return false;
+        if (typeof value === "string")
+            return value.trim().length > 0;
+        if (Array.isArray(value))
+            return value.length > 0;
+        return true;
+    }));
+}
+function frontmatterValue(attributes, ...keys) {
+    for (const key of keys) {
+        const value = attributes[key];
+        if (typeof value === "string" && value.trim().length > 0) {
+            return value.trim();
+        }
+    }
+    return undefined;
+}
+function extractKnowledgeTitle(file) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    const explicitTitle = frontmatterValue(parsed.attributes, "title");
+    if (explicitTitle) {
+        return explicitTitle;
+    }
+    const firstHeading = parsed.body.split(/\r?\n/).find((line) => /^#\s+/.test(line));
+    if (firstHeading) {
+        return firstHeading.replace(/^#\s+/, "").trim();
+    }
+    return inferTitleFromPathOrContent(file.path, file.content);
+}
+function extractKnowledgeTopics(file) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    const explicitTopics = frontmatterValue(parsed.attributes, "topics");
+    const topics = explicitTopics
+        ? extractDelimitedValues(explicitTopics)
+        : [
+            ...extractDelimitedValues(frontmatterValue(parsed.attributes, "tags")),
+            ...extractDelimitedValues(frontmatterValue(parsed.attributes, "keywords")),
+        ];
+    return [...new Set(topics)];
+}
+function extractKnowledgeRefs(file, ...keys) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    const values = keys.flatMap((key) => extractDelimitedValues(frontmatterValue(parsed.attributes, key)));
+    return [...new Set(values)];
+}
+function extractKnowledgeKindOverride(file) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    return frontmatterValue(parsed.attributes, "kind");
+}
+function extractSourceTypeOverride(file) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    return frontmatterValue(parsed.attributes, "source_type", "sourceType");
+}
+function extractUrlOverride(file) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    return frontmatterValue(parsed.attributes, "url", "source_url", "sourceUrl");
+}
+function extractDomainOverride(file) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    return frontmatterValue(parsed.attributes, "domain");
+}
+function extractAuthorsOverride(file) {
+    return extractKnowledgeRefs(file, "authors", "author");
+}
+function extractPublisherOverride(file) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    return frontmatterValue(parsed.attributes, "publisher");
+}
+function extractCreatedAtOverride(file) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    return frontmatterValue(parsed.attributes, "created_at", "createdAt");
+}
+function extractSourcePathOverride(file) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    return frontmatterValue(parsed.attributes, "source_path", "sourcePath");
+}
+function extractDerivedFromRefs(file) {
+    return extractKnowledgeRefs(file, "derived_from", "derivedFrom");
+}
+function extractCorrectsRefs(file) {
+    return extractKnowledgeRefs(file, "corrects", "correct");
+}
+function extractCorrectionOfRefs(file) {
+    return extractKnowledgeRefs(file, "correction_of", "correctionOf");
+}
+function extractSupersedesRefs(file) {
+    return extractKnowledgeRefs(file, "supersedes");
+}
+function extractSupersededByRefs(file) {
+    return extractKnowledgeRefs(file, "superseded_by", "supersededBy");
+}
+function inferOriginAgent(filePath) {
+    const match = filePath.match(/^agents\/([^/]+)\//);
+    if (match) {
+        return match[1];
+    }
+    return "main";
+}
+function summarizeKnowledgeBody(file, maxChars = 240) {
+    const parsed = parseSimpleFrontmatter(file.content);
+    return summarizeMemorySearchText(parsed.body, maxChars);
+}
+function inferMemoryKnowledgeKind(file) {
+    const explicitKind = extractKnowledgeKindOverride(file);
+    if (explicitKind) {
+        return explicitKind;
+    }
+    if (isToolManagedMemoryFile(file)) {
+        return "tool-managed-note";
+    }
+    const profile = classifyCompactionProfile(file);
+    if (profile === "daily-log")
+        return "daily-log";
+    if (profile === "worklog")
+        return "worklog";
+    if (profile === "reference-note")
+        return "reference-note";
+    return "general-note";
+}
+function inferLibraryKnowledgeKind(file) {
+    const explicitKind = extractKnowledgeKindOverride(file);
+    if (explicitKind) {
+        return explicitKind;
+    }
+    return file.path.startsWith("retained/") ? "retained-source" : "mirror-source";
+}
+function buildMemoryDatasetData(file, profile) {
+    const title = extractKnowledgeTitle(file);
+    const originAgent = inferOriginAgent(file.path);
+    const topics = extractKnowledgeTopics(file);
+    const sourceType = extractSourceTypeOverride(file);
+    const sourcePath = extractSourcePathOverride(file);
+    const createdAt = extractCreatedAtOverride(file);
+    const derivedFrom = extractDerivedFromRefs(file);
+    const corrects = extractCorrectsRefs(file);
+    const correctionOf = extractCorrectionOfRefs(file);
+    const supersedes = extractSupersedesRefs(file);
+    const supersededBy = extractSupersededByRefs(file);
+    const summary = summarizeKnowledgeBody(file);
+    const metadata = compactMetadata({
+        path: file.path,
+        source: "memory",
+        ingestMode: profile.ingestMode,
+        kind: inferMemoryKnowledgeKind(file),
+        title,
+        originAgent,
+        sourceType,
+        sourcePath,
+        createdAt,
+        derivedFrom,
+        corrects,
+        correctionOf,
+        supersedes,
+        supersededBy,
+        topics,
+    });
+    return [
+        `# ${file.path}`,
+        "",
+        "Dataset: memory",
+        `Title: ${title}`,
+        `Knowledge kind: ${metadata.kind}`,
+        `Origin agent: ${originAgent}`,
+        ...(sourceType ? [`Source type: ${sourceType}`] : []),
+        ...(sourcePath ? [`Source path: ${sourcePath}`] : []),
+        ...(createdAt ? [`Created at: ${createdAt}`] : []),
+        `Ingest mode: ${metadata.ingestMode}`,
+        ...(topics.length > 0 ? [`Topics: ${topics.join(", ")}`] : []),
+        ...(derivedFrom.length > 0 ? [`Derived from: ${derivedFrom.join(", ")}`] : []),
+        ...(corrects.length > 0 ? [`Corrects: ${corrects.join(", ")}`] : []),
+        ...(correctionOf.length > 0 ? [`Correction of: ${correctionOf.join(", ")}`] : []),
+        ...(supersedes.length > 0 ? [`Supersedes: ${supersedes.join(", ")}`] : []),
+        ...(supersededBy.length > 0 ? [`Superseded by: ${supersededBy.join(", ")}`] : []),
+        "",
+        "Knowledge summary:",
+        summary,
+        "",
+        file.content,
+        "",
+        "---",
+        `Metadata: ${JSON.stringify(metadata)}`,
+    ].join("\n");
+}
+function buildLibraryDatasetData(file, profile) {
+    const title = extractKnowledgeTitle(file);
+    const sourceType = extractSourceTypeOverride(file);
+    const storageType = file.sourceMetadata?.storageType ?? (file.path.startsWith("retained/") ? "retained" : "mirror");
+    const topics = extractKnowledgeTopics(file);
+    const url = extractUrlOverride(file);
+    const domain = extractDomainOverride(file);
+    const authors = extractAuthorsOverride(file);
+    const publisher = extractPublisherOverride(file);
+    const summary = summarizeKnowledgeBody(file, 320);
+    const metadata = compactMetadata({
+        path: file.path,
+        source: "library",
+        ingestMode: profile.ingestMode,
+        kind: inferLibraryKnowledgeKind(file),
+        title,
+        sourceType,
+        storageType,
+        url,
+        domain,
+        authors,
+        publisher,
+        originalPath: file.sourceMetadata?.originalPath,
+        retainedAssetId: file.sourceMetadata?.retainedAssetId,
+        importedAt: file.sourceMetadata?.importedAt,
+        topics,
+    });
+    return [
+        `# ${file.path}`,
+        "",
+        "Dataset: library",
+        `Title: ${title}`,
+        `Knowledge kind: ${metadata.kind}`,
+        ...(sourceType ? [`Source type: ${sourceType}`] : []),
+        `Storage type: ${storageType}`,
+        ...(url ? [`URL: ${url}`] : []),
+        ...(domain ? [`Domain: ${domain}`] : []),
+        ...(authors.length > 0 ? [`Authors: ${authors.join(", ")}`] : []),
+        ...(publisher ? [`Publisher: ${publisher}`] : []),
+        ...(file.sourceMetadata?.originalPath ? [`Original path: ${file.sourceMetadata.originalPath}`] : []),
+        ...(file.sourceMetadata?.retainedAssetId ? [`Retained asset: ${file.sourceMetadata.retainedAssetId}`] : []),
+        ...(file.sourceMetadata?.importedAt ? [`Imported at: ${file.sourceMetadata.importedAt}`] : []),
+        `Ingest mode: ${metadata.ingestMode}`,
+        ...(topics.length > 0 ? [`Topics: ${topics.join(", ")}`] : []),
+        "",
+        "Knowledge summary:",
+        summary,
+        "",
+        file.content,
+        "",
+        "---",
+        `Metadata: ${JSON.stringify(metadata)}`,
+    ].join("\n");
+}
+function buildDatasetData(file, datasetKey, profile) {
+    return datasetKey === "memory"
+        ? buildMemoryDatasetData(file, profile)
+        : buildLibraryDatasetData(file, profile);
+}
+function buildFileSemanticDetails(file, datasetKey) {
+    if (!file) {
+        return {};
+    }
+    const title = extractKnowledgeTitle(file);
+    const kind = datasetKey === "memory" ? inferMemoryKnowledgeKind(file) : inferLibraryKnowledgeKind(file);
+    const topics = extractKnowledgeTopics(file);
+    const sourceType = extractSourceTypeOverride(file);
+    const memoryRelations = datasetKey === "memory"
+        ? compactMetadata({
+            derivedFrom: extractDerivedFromRefs(file),
+            corrects: extractCorrectsRefs(file),
+            correctionOf: extractCorrectionOfRefs(file),
+            supersedes: extractSupersedesRefs(file),
+            supersededBy: extractSupersededByRefs(file),
+        })
+        : undefined;
+    const details = compactMetadata({
+        title,
+        kind,
+        originAgent: datasetKey === "memory" ? inferOriginAgent(file.path) : undefined,
+        sourceType,
+        sourcePath: datasetKey === "memory" ? extractSourcePathOverride(file) : undefined,
+        createdAt: datasetKey === "memory" ? extractCreatedAtOverride(file) : undefined,
+        derivedFrom: datasetKey === "memory" ? memoryRelations?.derivedFrom : undefined,
+        corrects: datasetKey === "memory" ? memoryRelations?.corrects : undefined,
+        correctionOf: datasetKey === "memory" ? memoryRelations?.correctionOf : undefined,
+        supersedes: datasetKey === "memory" ? memoryRelations?.supersedes : undefined,
+        supersededBy: datasetKey === "memory" ? memoryRelations?.supersededBy : undefined,
+        relations: datasetKey === "memory" ? memoryRelations : undefined,
+        topics,
+        storageType: datasetKey === "library" ? file.sourceMetadata?.storageType : undefined,
+        url: datasetKey === "library" ? extractUrlOverride(file) : undefined,
+        domain: datasetKey === "library" ? extractDomainOverride(file) : undefined,
+        authors: datasetKey === "library" ? extractAuthorsOverride(file) : undefined,
+        publisher: datasetKey === "library" ? extractPublisherOverride(file) : undefined,
+        originalPath: datasetKey === "library" ? file.sourceMetadata?.originalPath : undefined,
+        retainedAssetId: datasetKey === "library" ? file.sourceMetadata?.retainedAssetId : undefined,
+        importedAt: datasetKey === "library" ? file.sourceMetadata?.importedAt : undefined,
+    });
+    return details;
+}
+function buildMemoryRelationSummary(details) {
+    const parts = [];
+    const relationKeys = [
+        ["derivedFrom", "derivedFrom"],
+        ["corrects", "corrects"],
+        ["correctionOf", "correctionOf"],
+        ["supersedes", "supersedes"],
+        ["supersededBy", "supersededBy"],
+    ];
+    for (const [key, label] of relationKeys) {
+        const value = details[key];
+        if (Array.isArray(value) && value.length > 0) {
+            parts.push(`${label}=${value.join(", ")}`);
+        }
+    }
+    return parts.length > 0 ? parts.join(" | ") : undefined;
+}
+function buildMemoryDisplayFlags(details) {
+    const flags = [];
+    const hasRelations = (key) => Array.isArray(details[key]) && details[key].length > 0;
+    if (hasRelations("corrects") || hasRelations("correctionOf")) {
+        flags.push("correction-related");
+    }
+    if (hasRelations("supersededBy")) {
+        flags.push("superseded");
+    }
+    if (hasRelations("supersedes")) {
+        flags.push("superseding");
+    }
+    return flags;
+}
+const MEMORY_SUPERSEDED_SCORE_PENALTY = 0.08;
+function applySemanticSearchAdjustments(datasetKey, details, adjustedScore) {
+    if (datasetKey !== "memory") {
+        return adjustedScore;
+    }
+    const hasSupersededBy = Array.isArray(details.supersededBy) && details.supersededBy.length > 0;
+    if (!hasSupersededBy) {
+        return adjustedScore;
+    }
+    return Number((adjustedScore - MEMORY_SUPERSEDED_SCORE_PENALTY).toFixed(6));
 }
 function resolveConfig(rawConfig) {
     const raw = rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
@@ -651,6 +1011,18 @@ function resolveConfig(rawConfig) {
                 autoRecall: typeof memoryRaw.autoRecall === "boolean"
                     ? memoryRaw.autoRecall
                     : legacyAutoRecall ?? DEFAULT_MEMORY_AUTO_RECALL,
+                searchType: memoryRaw.searchType || raw.searchType || DEFAULT_SEARCH_TYPE,
+                searchPrompt: typeof memoryRaw.searchPrompt === "string"
+                    ? memoryRaw.searchPrompt
+                    : raw.searchPrompt || DEFAULT_SEARCH_PROMPT,
+                maxTokens: typeof memoryRaw.maxTokens === "number"
+                    ? memoryRaw.maxTokens
+                    : typeof raw.maxTokens === "number"
+                        ? raw.maxTokens
+                        : DEFAULT_MAX_TOKENS,
+                ingestMode: typeof memoryRaw.ingestMode === "string" && memoryRaw.ingestMode.trim().length > 0
+                    ? memoryRaw.ingestMode.trim()
+                    : "distilled-note-first",
             },
             library: {
                 datasetName: libraryRaw.datasetName?.trim() || DEFAULT_LIBRARY_DATASET_NAME,
@@ -664,6 +1036,18 @@ function resolveConfig(rawConfig) {
                 autoRecall: typeof libraryRaw.autoRecall === "boolean"
                     ? libraryRaw.autoRecall
                     : DEFAULT_LIBRARY_AUTO_RECALL,
+                searchType: libraryRaw.searchType || raw.searchType || DEFAULT_SEARCH_TYPE,
+                searchPrompt: typeof libraryRaw.searchPrompt === "string"
+                    ? libraryRaw.searchPrompt
+                    : raw.searchPrompt || DEFAULT_SEARCH_PROMPT,
+                maxTokens: typeof libraryRaw.maxTokens === "number"
+                    ? libraryRaw.maxTokens
+                    : typeof raw.maxTokens === "number"
+                        ? raw.maxTokens
+                        : DEFAULT_MAX_TOKENS,
+                ingestMode: typeof libraryRaw.ingestMode === "string" && libraryRaw.ingestMode.trim().length > 0
+                    ? libraryRaw.ingestMode.trim()
+                    : "document-graph-first",
             },
         },
     };
@@ -1013,7 +1397,7 @@ async function discoverConfiguredAgentWorkspaces() {
     }
     return bindings;
 }
-async function readMarkdownFile(absPath, virtualPath) {
+async function readMarkdownFile(absPath, virtualPath, sourceMetadata) {
     const stat = await fs.stat(absPath);
     const content = await fs.readFile(absPath, "utf-8");
     return {
@@ -1022,9 +1406,10 @@ async function readMarkdownFile(absPath, virtualPath) {
         content,
         hash: hashText(content),
         mtimeMs: stat.mtimeMs,
+        sourceMetadata,
     };
 }
-async function scanMarkdownDir(rootDir, mapVirtualPath) {
+async function scanMarkdownDir(rootDir, mapVirtualPath, mapSourceMetadata) {
     const files = [];
     let entries;
     try {
@@ -1039,12 +1424,12 @@ async function scanMarkdownDir(rootDir, mapVirtualPath) {
     for (const entry of entries) {
         const absPath = join(rootDir, entry.name);
         if (entry.isDirectory()) {
-            files.push(...(await scanMarkdownDir(absPath, mapVirtualPath)));
+            files.push(...(await scanMarkdownDir(absPath, mapVirtualPath, mapSourceMetadata)));
             continue;
         }
         if (!entry.isFile() || !entry.name.endsWith(".md"))
             continue;
-        files.push(await readMarkdownFile(absPath, mapVirtualPath(absPath)));
+        files.push(await readMarkdownFile(absPath, mapVirtualPath(absPath), mapSourceMetadata?.(absPath)));
     }
     return files;
 }
@@ -1096,15 +1481,26 @@ async function collectLibraryDatasetFiles(workspaceDir, profile) {
         if (source.isFile) {
             if (!source.rootPath.endsWith(".md"))
                 continue;
-            files.push(await readMarkdownFile(source.rootPath, `${source.virtualBase}/${basename(source.rootPath)}`));
+            files.push(await readMarkdownFile(source.rootPath, `${source.virtualBase}/${basename(source.rootPath)}`, {
+                originalPath: source.rootPath,
+                storageType: "mirror",
+            }));
             continue;
         }
-        files.push(...(await scanMarkdownDir(source.rootPath, (absPath) => `${source.virtualBase}/${normalizeDatasetPath(relative(source.rootPath, absPath))}`)));
+        files.push(...(await scanMarkdownDir(source.rootPath, (absPath) => `${source.virtualBase}/${normalizeDatasetPath(relative(source.rootPath, absPath))}`, (absPath) => ({
+            originalPath: absPath,
+            storageType: "mirror",
+        }))));
     }
     const retainedManifest = await loadRetainedLibraryManifest();
     for (const asset of retainedManifest.assets) {
         try {
-            files.push(await readMarkdownFile(asset.storagePath, asset.virtualPath));
+            files.push(await readMarkdownFile(asset.storagePath, asset.virtualPath, {
+                originalPath: asset.originalPath,
+                storageType: "retained",
+                retainedAssetId: asset.assetId,
+                importedAt: asset.importedAt,
+            }));
         }
         catch (error) {
             if (error.code !== "ENOENT")
@@ -1372,7 +1768,7 @@ async function syncFiles(client, changedFiles, fullFiles, syncIndex, cfg, logger
             result.skipped++;
             continue;
         }
-        const dataWithMetadata = buildMemoryData(file, cfg.datasetKey);
+        const dataWithMetadata = buildDatasetData(file, cfg.datasetKey, cfg.profile);
         try {
             if (existing?.dataId && datasetId) {
                 try {
@@ -1546,6 +1942,7 @@ function datasetCfgForSync(cfg, datasetKey) {
         datasetName: profile.datasetName,
         autoCognify: profile.autoCognify,
         deleteMode: cfg.deleteMode,
+        profile,
     };
 }
 async function resolveWritableMemoryTarget(pathInput, workspaceDir) {
@@ -1674,36 +2071,55 @@ async function searchDataset(params) {
     const fileByPath = new Map(files.map((file) => [file.path, file]));
     const merged = new Map();
     const limit = params.limit ?? params.cfg.maxResults;
+    const datasetProfile = params.cfg.datasets[params.datasetKey];
+    const telemetry = {
+        remoteAttempted: false,
+        remoteUsed: false,
+        remoteHitCount: 0,
+        fallbackUsed: false,
+        fallbackHitCount: 0,
+        strictRemote: params.strictRemote === true,
+    };
     for (const file of files) {
         const baseScore = scoreLocalQuery(params.query, file);
         if (baseScore <= 0)
             continue;
         const signals = params.ranking.entries[file.path] ?? defaultSignals();
+        const semanticDetails = buildFileSemanticDetails(file, params.datasetKey);
         merged.set(file.path, {
             dataset: params.datasetKey,
             path: file.path,
             absPath: file.absPath,
+            file,
             text: file.content,
             baseScore,
-            adjustedScore: adjustSearchScore({
+            adjustedScore: applySemanticSearchAdjustments(params.datasetKey, semanticDetails, adjustSearchScore({
                 datasetKey: params.datasetKey,
                 baseScore,
                 signals,
                 fileMtimeMs: file.mtimeMs,
                 cfg: params.cfg,
-            }),
+            })),
             signals: { ...signals },
         });
     }
-    if (params.datasetId) {
+    const localMatchCount = merged.size;
+    if (!params.datasetId) {
+        if (telemetry.strictRemote) {
+            throw new Error(`Remote Cognee search is unavailable for dataset "${params.datasetKey}" because no dataset ID is loaded.`);
+        }
+    }
+    else {
+        telemetry.remoteAttempted = true;
         try {
             const remoteResults = await params.client.search({
                 queryText: params.query,
-                searchPrompt: params.cfg.searchPrompt,
-                searchType: params.cfg.searchType,
+                searchPrompt: datasetProfile.searchPrompt,
+                searchType: datasetProfile.searchType,
                 datasetIds: [params.datasetId],
-                maxTokens: params.cfg.maxTokens,
+                maxTokens: datasetProfile.maxTokens,
             });
+            telemetry.remoteUsed = true;
             for (const result of remoteResults) {
                 const path = extractVirtualPathFromSearchResult(result);
                 if (!path)
@@ -1711,17 +2127,20 @@ async function searchDataset(params) {
                 const file = fileByPath.get(path);
                 const signals = params.ranking.entries[path] ?? defaultSignals();
                 const existing = merged.get(path);
-                const adjustedScore = adjustSearchScore({
+                const semanticDetails = file ? buildFileSemanticDetails(file, params.datasetKey) : {};
+                telemetry.remoteHitCount += 1;
+                const adjustedScore = applySemanticSearchAdjustments(params.datasetKey, semanticDetails, adjustSearchScore({
                     datasetKey: params.datasetKey,
                     baseScore: result.score,
                     signals,
                     fileMtimeMs: file?.mtimeMs,
                     cfg: params.cfg,
-                });
+                }));
                 merged.set(path, {
                     dataset: params.datasetKey,
                     path,
                     absPath: file?.absPath,
+                    file,
                     text: file?.content ?? result.text,
                     baseScore: existing ? Math.max(existing.baseScore, result.score) : result.score,
                     adjustedScore: existing ? Math.max(existing.adjustedScore, adjustedScore) : adjustedScore,
@@ -1729,14 +2148,22 @@ async function searchDataset(params) {
                 });
             }
         }
-        catch {
-            // local search fallback is enough
+        catch (error) {
+            telemetry.remoteError = sanitizeSearchError(error);
+            if (telemetry.strictRemote) {
+                throw new Error(`Remote Cognee search failed: ${telemetry.remoteError}`);
+            }
+            telemetry.fallbackUsed = true;
+            telemetry.fallbackHitCount = localMatchCount;
         }
     }
-    return [...merged.values()]
-        .filter((item) => item.adjustedScore >= params.cfg.minScore)
-        .sort((a, b) => b.adjustedScore - a.adjustedScore)
-        .slice(0, limit);
+    return {
+        results: [...merged.values()]
+            .filter((item) => item.adjustedScore >= params.cfg.minScore)
+            .sort((a, b) => b.adjustedScore - a.adjustedScore)
+            .slice(0, limit),
+        telemetry,
+    };
 }
 const memoryCogneePlugin = {
     id: "memory-cognee-revised",
@@ -1920,7 +2347,7 @@ const memoryCogneePlugin = {
                 query: params.query,
                 limit: 1,
             });
-            return results[0]?.absPath ? files.find((file) => file.path === results[0].path) : undefined;
+            return results.results[0]?.absPath ? files.find((file) => file.path === results.results[0].path) : undefined;
         }
         async function forgetMemory(params) {
             const file = await resolveFileTarget(params.datasetKey, params.workspaceDir, {
@@ -2223,6 +2650,11 @@ const memoryCogneePlugin = {
                             query: { type: "string", description: "Search query" },
                             dataset: { type: "string", enum: ["memory", "library"], description: "Target dataset (default: memory)" },
                             limit: { type: "number", description: "Maximum results" },
+                            debug: { type: "boolean", description: "Include backend search diagnostics for debugging." },
+                            strictRemote: {
+                                type: "boolean",
+                                description: "Disable local fallback and fail if remote Cognee search fails or is unavailable.",
+                            },
                             scope: { type: "string", description: "Legacy compatibility field. Ignored by the dataset-based plugin." },
                         },
                         required: ["query"],
@@ -2231,7 +2663,7 @@ const memoryCogneePlugin = {
                     async execute(_toolCallId, params) {
                         const datasetKey = resolveDatasetKey(params.dataset);
                         await ensureDatasetLoaded(datasetKey);
-                        const results = await searchDataset({
+                        const search = await searchDataset({
                             client,
                             cfg,
                             datasetKey,
@@ -2241,39 +2673,71 @@ const memoryCogneePlugin = {
                             ranking: rankingStates[datasetKey],
                             query: params.query,
                             limit: params.limit,
+                            strictRemote: params.strictRemote === true,
                         });
-                        if (results.length === 0) {
-                            return renderToolText([`No results found in dataset "${datasetKey}".`]);
+                        const warningText = buildSearchWarningText(datasetKey, search.telemetry, search.results.length > 0);
+                        const includeSearchDebug = params.debug === true || typeof warningText === "string";
+                        if (search.results.length === 0) {
+                            const lines = [`No results found in dataset "${datasetKey}".`];
+                            if (warningText) {
+                                lines.push(warningText);
+                            }
+                            if (params.debug === true) {
+                                lines.push(...buildSearchDebugLines(search.telemetry));
+                            }
+                            return renderToolText(lines, includeSearchDebug ? { searchDebug: search.telemetry } : {});
                         }
-                        await markSearchHits(datasetKey, results);
+                        await markSearchHits(datasetKey, search.results);
                         const compactionManifest = datasetKey === "memory" ? await loadCompactionManifest() : undefined;
+                        const body = search.results
+                            .map((result, index) => {
+                            const displayPath = toolDisplayPath(datasetKey, result.path);
+                            const snippet = summarizeMemorySearchText(result.text);
+                            const semanticDetails = buildFileSemanticDetails(result.file, datasetKey);
+                            const relationSummary = datasetKey === "memory"
+                                ? buildMemoryRelationSummary(semanticDetails)
+                                : undefined;
+                            const displayFlags = datasetKey === "memory"
+                                ? buildMemoryDisplayFlags(semanticDetails)
+                                : [];
+                            return [
+                                `${index + 1}. ${displayPath} (score=${result.adjustedScore.toFixed(3)}, base=${result.baseScore.toFixed(3)})`,
+                                `   ${snippet}`,
+                                ...(relationSummary ? [`   relations: ${relationSummary}`] : []),
+                                ...(displayFlags.length > 0 ? [`   flags: ${displayFlags.join(", ")}`] : []),
+                            ].join("\n");
+                        })
+                            .join("\n");
+                        const textLines = [
+                            ...(warningText ? [warningText] : []),
+                            body,
+                            ...(params.debug === true ? buildSearchDebugLines(search.telemetry) : []),
+                        ];
                         return {
                             content: [
                                 {
                                     type: "text",
-                                    text: results
-                                        .map((result, index) => {
-                                        const displayPath = toolDisplayPath(datasetKey, result.path);
-                                        const snippet = summarizeMemorySearchText(result.text);
-                                        return `${index + 1}. ${displayPath} (score=${result.adjustedScore.toFixed(3)}, base=${result.baseScore.toFixed(3)})\n   ${snippet}`;
-                                    })
-                                        .join("\n"),
+                                    text: textLines.join("\n"),
                                 },
                             ],
                             details: {
                                 dataset: datasetKey,
-                                count: results.length,
+                                count: search.results.length,
                                 scopeIgnored: typeof params.scope === "string" ? params.scope : undefined,
-                                results: results.map((result) => {
+                                ...(includeSearchDebug ? { searchDebug: search.telemetry } : {}),
+                                results: search.results.map((result) => {
                                     const artifact = datasetKey === "memory"
                                         ? compactionManifest?.artifacts.find((entry) => entry.replacementPath === result.path)
                                         : undefined;
+                                    const semanticDetails = buildFileSemanticDetails(result.file, datasetKey);
                                     return {
                                         path: toolDisplayPath(datasetKey, result.path),
                                         virtualPath: result.path,
                                         lifecycle: inferLifecycleForPath(datasetKey, result.path, compactionManifest),
                                         ...(artifact?.summaryMode ? { summaryMode: artifact.summaryMode } : {}),
                                         ...(artifact?.summaryModelRef ? { summaryModelRef: artifact.summaryModelRef } : {}),
+                                        ...semanticDetails,
+                                        ...(datasetKey === "memory" ? { displayFlags: buildMemoryDisplayFlags(semanticDetails) } : {}),
                                         text: summarizeMemorySearchText(result.text, 600),
                                         adjustedScore: result.adjustedScore,
                                         baseScore: result.baseScore,
@@ -2365,6 +2829,7 @@ const memoryCogneePlugin = {
                         const artifact = datasetKey === "memory"
                             ? compactionManifest?.artifacts.find((entry) => entry.replacementPath === file.path)
                             : undefined;
+                        const semanticDetails = buildFileSemanticDetails(file, datasetKey);
                         return {
                             content: [{ type: "text", text: file.content }],
                             details: {
@@ -2374,6 +2839,8 @@ const memoryCogneePlugin = {
                                 lifecycle: inferLifecycleForPath(datasetKey, file.path, compactionManifest),
                                 ...(artifact?.summaryMode ? { summaryMode: artifact.summaryMode } : {}),
                                 ...(artifact?.summaryModelRef ? { summaryModelRef: artifact.summaryModelRef } : {}),
+                                ...semanticDetails,
+                                ...(datasetKey === "memory" ? { displayFlags: buildMemoryDisplayFlags(semanticDetails) } : {}),
                                 absPath: file.absPath,
                             },
                         };
@@ -2520,10 +2987,12 @@ const memoryCogneePlugin = {
                 .argument("<query>", "Search query")
                 .option("--dataset <dataset>", "Target dataset (memory|library)", "memory")
                 .option("--limit <n>", "Maximum results", String(DEFAULT_MAX_RESULTS))
+                .option("--strict-remote", "Disable local fallback and fail if remote Cognee search fails or is unavailable", false)
+                .option("--debug-search", "Print backend search diagnostics for debugging", false)
                 .action(async (query, opts) => {
                 const datasetKey = resolveDatasetKey(opts.dataset);
                 await ensureDatasetLoaded(datasetKey);
-                const results = await searchDataset({
+                const search = await searchDataset({
                     client,
                     cfg,
                     datasetKey,
@@ -2533,13 +3002,23 @@ const memoryCogneePlugin = {
                     ranking: rankingStates[datasetKey],
                     query,
                     limit: opts.limit ? Number.parseInt(opts.limit, 10) : undefined,
+                    strictRemote: opts.strictRemote === true,
                 });
-                if (results.length === 0) {
+                const warningText = buildSearchWarningText(datasetKey, search.telemetry, search.results.length > 0);
+                if (warningText) {
+                    console.log(warningText);
+                }
+                if (opts.debugSearch === true) {
+                    for (const line of buildSearchDebugLines(search.telemetry)) {
+                        console.log(line);
+                    }
+                }
+                if (search.results.length === 0) {
                     console.log(`[${datasetKey}] no results`);
                     return;
                 }
-                await markSearchHits(datasetKey, results);
-                for (const result of results) {
+                await markSearchHits(datasetKey, search.results);
+                for (const result of search.results) {
                     console.log(`${result.path}\t${result.adjustedScore.toFixed(3)}`);
                 }
             });
@@ -2884,5 +3363,5 @@ const memoryCogneePlugin = {
 };
 export default memoryCogneePlugin;
 export { CogneeClient, syncFiles };
-export { resolveConfig, resolveDatasetKey, datasetSyncIndexPath, datasetRankingPath, loadDatasetSyncIndex, saveDatasetSyncIndex, loadRankingState, saveRankingState, discoverConfiguredAgentWorkspaces, collectMemoryDatasetFiles, collectLibraryDatasetFiles, collectDatasetFiles, librarySourceVirtualBase, adjustSearchScore, applyDeprioritizeSignals, computeCleanupSuggestions, classifyCompactionProfile, buildCompactionSystemPrompt, summarizeRetainedCapacity, buildRetainedCapacityLines, computeRetainedCleanupSuggestions, computeCompactSuggestions, importRetainedLibraryAsset, extractVirtualPathFromSearchResult, };
+export { resolveConfig, resolveDatasetKey, datasetSyncIndexPath, datasetRankingPath, loadDatasetSyncIndex, saveDatasetSyncIndex, loadRankingState, saveRankingState, discoverConfiguredAgentWorkspaces, collectMemoryDatasetFiles, collectLibraryDatasetFiles, collectDatasetFiles, librarySourceVirtualBase, adjustSearchScore, applyDeprioritizeSignals, computeCleanupSuggestions, classifyCompactionProfile, buildCompactionSystemPrompt, buildMemoryDatasetData, buildLibraryDatasetData, buildFileSemanticDetails, buildMemoryDisplayFlags, applySemanticSearchAdjustments, summarizeRetainedCapacity, buildRetainedCapacityLines, computeRetainedCleanupSuggestions, computeCompactSuggestions, importRetainedLibraryAsset, extractVirtualPathFromSearchResult, };
 //# sourceMappingURL=index.js.map

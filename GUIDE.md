@@ -89,6 +89,7 @@ Retrieval priority:
 - Need user preference / recurring pattern / historical fix / reminder -> vestige first
 - Need original note / paper / evidence / durable file content -> cognee first
 - If vestige returns an abstract memory and you need evidence, follow up with cognee to fetch the underlying note or library material
+- When reading `memory_search` results from cognee, check `relations` and `displayFlags` before trusting an entry as current truth; treat `superseded` results as historical unless the user explicitly asks for prior state
 
 Conflict rules:
 
@@ -96,6 +97,32 @@ Conflict rules:
 - Update or correct the cognee note first, then promote/demote or rewrite vestige memory as needed
 - Do not delete original library material from vestige
 - Do not use cognee to manage reminders
+
+Correction Protocol:
+
+When any memory is found to be incorrect:
+
+1. vestige `demote_memory`: target the incorrect memory or its defining keywords
+2. cognee `memory_forget` with `deprioritize`: target the incorrect note or memory content
+3. vestige `smart_ingest`: ingest the corrected content, then `promote_memory` if it should be strongly retained
+4. cognee `memory_store`: write `Correction: [corrected content]` into the `memory` dataset
+5. append the correction trail to `memory/corrections.md`
+
+When storing the correction note in cognee:
+
+- prefer markdown frontmatter that records correction-chain semantics such as `corrects`, `correction_of`, `supersedes`, `superseded_by`, `derived_from`, `source_path`, and `created_at`
+- do not rely on free-form prose alone when the correction target or replacement path is known
+
+Do not correct only one system when the same mistake exists in both vestige and cognee.
+
+Session Initialization Order:
+
+1. vestige `session_context` with `token_budget: 800`
+2. cognee recall only if the topic is identifiable and warrants external durable memory lookup
+3. if cognee recall is needed, use `memory` with `maxResults: 4` and `library` with `maxResults: 2`
+
+Do not call both vestige `search` and vestige `session_context` at the same session start.
+Do not automatically call cognee recall at every session start; only do so when topic signals justify it.
 
 Academic workflow rules:
 

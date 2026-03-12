@@ -121,6 +121,10 @@ describe("workspace aggregation + library discovery", () => {
       autoIndex: false,
       autoCognify: false,
       autoRecall: false,
+      searchType: "GRAPH_COMPLETION",
+      searchPrompt: "",
+      maxTokens: 512,
+      ingestMode: "document-graph-first",
     });
     expect(files.map((file) => file.path)).toEqual([
       `${librarySourceVirtualBase("/workspace/main/library")}/guide.md`,

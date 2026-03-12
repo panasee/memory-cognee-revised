@@ -59,6 +59,17 @@ describe("syncFiles", () => {
       datasetName: "memory-ds",
       autoCognify: true,
       deleteMode: "soft",
+      profile: {
+        datasetName: "memory-ds",
+        paths: [],
+        autoIndex: true,
+        autoCognify: true,
+        autoRecall: true,
+        searchType: "GRAPH_COMPLETION",
+        searchPrompt: "",
+        maxTokens: 512,
+        ingestMode: "distilled-note-first",
+      },
     };
     logger = { info: jest.fn(), warn: jest.fn() };
   });
@@ -73,7 +84,30 @@ describe("syncFiles", () => {
 
     expect(result).toEqual({ added: 1, updated: 0, skipped: 0, errors: 0, deleted: 0, datasetId: "ds1" });
     expect(mockAdd).toHaveBeenCalledWith({
-      data: `# main/memory/new.md\n\ncontent\n\n---\nMetadata: ${JSON.stringify({ path: "main/memory/new.md", source: "memory" })}`,
+      data: [
+        "# main/memory/new.md",
+        "",
+        "Dataset: memory",
+        "Title: new",
+        "Knowledge kind: general-note",
+        "Origin agent: main",
+        "Ingest mode: distilled-note-first",
+        "",
+        "Knowledge summary:",
+        "content",
+        "",
+        "content",
+        "",
+        "---",
+        `Metadata: ${JSON.stringify({
+          path: "main/memory/new.md",
+          source: "memory",
+          ingestMode: "distilled-note-first",
+          kind: "general-note",
+          title: "new",
+          originAgent: "main",
+        })}`,
+      ].join("\n"),
       datasetName: "memory-ds",
       datasetId: undefined,
     });
@@ -96,7 +130,30 @@ describe("syncFiles", () => {
     expect(mockUpdate).toHaveBeenCalledWith({
       dataId: "id1",
       datasetId: "ds1",
-      data: `# main/MEMORY.md\n\nnew content\n\n---\nMetadata: ${JSON.stringify({ path: "main/MEMORY.md", source: "memory" })}`,
+      data: [
+        "# main/MEMORY.md",
+        "",
+        "Dataset: memory",
+        "Title: MEMORY",
+        "Knowledge kind: general-note",
+        "Origin agent: main",
+        "Ingest mode: distilled-note-first",
+        "",
+        "Knowledge summary:",
+        "new content",
+        "",
+        "new content",
+        "",
+        "---",
+        `Metadata: ${JSON.stringify({
+          path: "main/MEMORY.md",
+          source: "memory",
+          ingestMode: "distilled-note-first",
+          kind: "general-note",
+          title: "MEMORY",
+          originAgent: "main",
+        })}`,
+      ].join("\n"),
     });
     expect(mockCognify).not.toHaveBeenCalled();
   });

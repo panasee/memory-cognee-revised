@@ -8,6 +8,10 @@ type DatasetProfileConfig = {
     autoIndex?: boolean;
     autoCognify?: boolean;
     autoRecall?: boolean;
+    searchType?: CogneeSearchType;
+    searchPrompt?: string;
+    maxTokens?: number;
+    ingestMode?: string;
 };
 type ResolvedDatasetProfile = {
     datasetName: string;
@@ -15,6 +19,10 @@ type ResolvedDatasetProfile = {
     autoIndex: boolean;
     autoCognify: boolean;
     autoRecall: boolean;
+    searchType: CogneeSearchType;
+    searchPrompt: string;
+    maxTokens: number;
+    ingestMode: string;
 };
 type CogneePluginConfig = {
     baseUrl?: string;
@@ -114,6 +122,12 @@ type MemoryFile = {
     content: string;
     hash: string;
     mtimeMs: number;
+    sourceMetadata?: {
+        originalPath?: string;
+        storageType?: "mirror" | "retained";
+        retainedAssetId?: string;
+        importedAt?: string;
+    };
 };
 type SyncResult = {
     added: number;
@@ -127,6 +141,7 @@ type DatasetSyncConfig = {
     datasetName: string;
     autoCognify: boolean;
     deleteMode: CogneeDeleteMode;
+    profile: ResolvedDatasetProfile;
 };
 type WorkspaceBinding = {
     kind: "main" | "agent";
@@ -203,6 +218,11 @@ declare function adjustSearchScore(params: {
     cfg: Pick<ResolvedCogneePluginConfig, "rankingPolicies">;
 }): number;
 declare function extractVirtualPathFromSearchResult(result: CogneeSearchResult): string | undefined;
+declare function buildMemoryDatasetData(file: MemoryFile, profile: ResolvedDatasetProfile): string;
+declare function buildLibraryDatasetData(file: MemoryFile, profile: ResolvedDatasetProfile): string;
+declare function buildFileSemanticDetails(file: MemoryFile | undefined, datasetKey: DatasetKey): Record<string, unknown>;
+declare function buildMemoryDisplayFlags(details: Record<string, unknown>): string[];
+declare function applySemanticSearchAdjustments(datasetKey: DatasetKey, details: Record<string, unknown>, adjustedScore: number): number;
 declare function resolveConfig(rawConfig: unknown): ResolvedCogneePluginConfig;
 declare function loadDatasetSyncIndex(datasetKey: DatasetKey): Promise<SyncIndex>;
 declare function saveDatasetSyncIndex(datasetKey: DatasetKey, index: SyncIndex): Promise<void>;
@@ -296,5 +316,5 @@ declare const memoryCogneePlugin: {
 };
 export default memoryCogneePlugin;
 export { CogneeClient, syncFiles };
-export { resolveConfig, resolveDatasetKey, datasetSyncIndexPath, datasetRankingPath, loadDatasetSyncIndex, saveDatasetSyncIndex, loadRankingState, saveRankingState, discoverConfiguredAgentWorkspaces, collectMemoryDatasetFiles, collectLibraryDatasetFiles, collectDatasetFiles, librarySourceVirtualBase, adjustSearchScore, applyDeprioritizeSignals, computeCleanupSuggestions, classifyCompactionProfile, buildCompactionSystemPrompt, summarizeRetainedCapacity, buildRetainedCapacityLines, computeRetainedCleanupSuggestions, computeCompactSuggestions, importRetainedLibraryAsset, extractVirtualPathFromSearchResult, };
+export { resolveConfig, resolveDatasetKey, datasetSyncIndexPath, datasetRankingPath, loadDatasetSyncIndex, saveDatasetSyncIndex, loadRankingState, saveRankingState, discoverConfiguredAgentWorkspaces, collectMemoryDatasetFiles, collectLibraryDatasetFiles, collectDatasetFiles, librarySourceVirtualBase, adjustSearchScore, applyDeprioritizeSignals, computeCleanupSuggestions, classifyCompactionProfile, buildCompactionSystemPrompt, buildMemoryDatasetData, buildLibraryDatasetData, buildFileSemanticDetails, buildMemoryDisplayFlags, applySemanticSearchAdjustments, summarizeRetainedCapacity, buildRetainedCapacityLines, computeRetainedCleanupSuggestions, computeCompactSuggestions, importRetainedLibraryAsset, extractVirtualPathFromSearchResult, };
 export type { CogneeDeleteMode, CogneePluginConfig, DatasetKey, DatasetProfileConfig, ResolvedDatasetProfile, ResolvedCogneePluginConfig, MemoryFile, SyncIndex, SyncResult, RankingSignals, RankingState, DatasetSyncConfig, WorkspaceBinding, CleanupSuggestion, RetainedCapacitySummary, RetainedCleanupSuggestion, };
