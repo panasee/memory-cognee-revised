@@ -149,6 +149,8 @@ describe("workspace aggregation + library discovery", () => {
           "main/memory/stale.md": {
             recallCount: 0,
             searchHitCount: 0,
+            reinforcementCount: 0,
+            confirmedUsefulCount: 0,
             forgetCount: 2,
             deprioritized: true,
             lastDeprioritizedAt: 1,
@@ -173,7 +175,7 @@ describe("workspace aggregation + library discovery", () => {
     };
     const ranking = {
       entries: {
-        [file.path]: { recallCount: 0, searchHitCount: 0, forgetCount: 0 },
+        [file.path]: { recallCount: 0, searchHitCount: 0, reinforcementCount: 0, confirmedUsefulCount: 0, forgetCount: 0 },
       },
     };
     const cfg = resolveConfig({});
@@ -184,6 +186,31 @@ describe("workspace aggregation + library discovery", () => {
     expect(memorySuggestions).toHaveLength(1);
     expect(librarySuggestions).toHaveLength(1);
     expect(memorySuggestions[0].adjustedScore).toBeLessThan(librarySuggestions[0].adjustedScore);
+  });
+
+  it("does not flag explicitly reinforced stale memories as never retrieved", () => {
+    const file = {
+      path: "main/memory/reinforced.md",
+      absPath: "/workspace/main/memory/reinforced.md",
+      content: "important durable rule",
+      hash: "h-reinforced",
+      mtimeMs: 1,
+    };
+    const ranking = {
+      entries: {
+        [file.path]: {
+          recallCount: 0,
+          searchHitCount: 0,
+          reinforcementCount: 2,
+          confirmedUsefulCount: 1,
+          forgetCount: 0,
+          lastReinforcedAt: 100 * 86_400_000,
+        },
+      },
+    };
+    const suggestions = computeCleanupSuggestions("memory", [file], ranking, resolveConfig({}), 500 * 86_400_000);
+
+    expect(suggestions).toHaveLength(0);
   });
 
   it("routes reference-style compaction suggestions toward retained import", () => {

@@ -414,3 +414,95 @@ Add tests for:
 - document-level provenance preservation in `library`
 - `memory` correction-chain metadata handling
 - `library` retained/mirror metadata handling
+
+## 19. Add Explicit User-Led Reinforcement Primitives
+
+Status: completed
+
+The plugin previously used simple retrieval counters inside ranking.
+
+Add explicit user-led reinforcement primitives without depending on runtime conversation-turn tracking.
+
+### Landed behavior
+
+- add `memory_reinforce` tool for explicit reinforcement
+- add `openclaw cognee reinforce` CLI command
+- add `memory_confirm_useful` tool for explicit "this recalled memory was useful" recording
+- add `openclaw cognee confirm-useful` CLI command
+
+### Important boundary
+
+- only explicit operator or tool actions can reinforce memory today
+- `searchHitCount` and `recallCount` remain telemetry signals
+- confirmation-of-usefulness does not auto-reinforce by itself
+- no conversation-turn-dependent auto-reinforcement is implemented in the current plugin
+
+## 20. Replace Linear Retrieval Boosting With Unified Decay Controls
+
+Status: completed
+
+The plugin previously used linear boost terms from hit and recall counters.
+
+Replace that with a unified decay / reinforcement model whose constants can be adjusted directly in code.
+
+### Landed parameter set
+
+- `baseHalfLifeDays`
+- `minFreshnessMultiplier`
+- `reinforcementFreshnessHalfLifeDays`
+- `reinforcementFactor`
+- `maxHalfLifeMultiplier`
+- `forgetPenalty`
+- `deprioritizedPenalty`
+
+### Landed behavior
+
+- reinforcement slows forgetting instead of directly stacking score boosts
+- reinforcement has a cap
+- reinforcement decays in strength when not refreshed
+- `memory` and `library` use separate defaults
+- operator-visible ranking diagnostics include reinforcement counts
+
+## 21. Add Conservative Low-Signal Input Filtering
+
+Status: completed
+
+The plugin previously accepted low-signal notes too easily.
+
+Add a deliberately narrow filter before durable write/import actions.
+
+### Landed behavior
+
+- reject greeting-like text
+- reject texts shorter than 10 tokens
+- apply the filter to `memory_store`
+- apply the filter to `compact-memory`
+- apply the filter to retained `library` import
+
+### Explicit non-goals for the landed version
+
+- do not yet filter generic boilerplate blocks
+- do not attempt broad semantic junk detection
+- keep filtering narrow until real false-positive/false-negative behavior is observed
+
+## 22. Add Relation-Aware And Compaction-Aware Duplicate Suppression
+
+Status: completed
+
+The plugin previously only had narrow write-time duplicate checking.
+
+Add stricter duplicate suppression while keeping retrieval semantics intact.
+
+### Landed behavior
+
+- keep write-time body-normalized duplicate detection for `memory_store`
+- collapse exact-body duplicate search results
+- collapse duplicate results from the same compaction family
+- suppress highly overlapping relation-linked duplicates conservatively
+- expose confirmation / reinforcement counters without automatically changing relation behavior
+
+### Explicit limits of the landed version
+
+- no heavy embedding MMR is used
+- no vector-based duplicate suppression is active yet
+- relation handling remains conservative to avoid hiding distinct but related memories

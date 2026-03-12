@@ -7,6 +7,7 @@ import {
   buildLibraryDatasetData,
   buildMemoryDatasetData,
   datasetSyncIndexPath,
+  isLowSignalMemoryText,
   loadDatasetSyncIndex,
   resolveConfig,
   resolveDatasetKey,
@@ -127,6 +128,11 @@ describe("dataset config + persistence", () => {
 });
 
 describe("dataset serializers", () => {
+  it("treats compact CJK sentences as token-bearing text for low-signal filtering", () => {
+    expect(isLowSignalMemoryText("记住这个部署流程")).toBe(false);
+    expect(isLowSignalMemoryText("你好")).toBe(true);
+  });
+
   it("emphasizes distilled memory metadata for memory dataset payloads", () => {
     const cfg = resolveConfig({});
     const payload = buildMemoryDatasetData({
@@ -382,7 +388,14 @@ describe("ranking signals", () => {
     const boosted = adjustSearchScore({
       datasetKey: "memory",
       baseScore: 0.6,
-      signals: { recallCount: 3, searchHitCount: 5, forgetCount: 0, lastHitAt: 2_000 },
+      signals: {
+        recallCount: 3,
+        searchHitCount: 5,
+        reinforcementCount: 1,
+        confirmedUsefulCount: 0,
+        forgetCount: 0,
+        lastReinforcedAt: 2_000,
+      },
       fileMtimeMs: 2_000,
       now: 2_500,
       cfg: resolveConfig({}),
@@ -404,7 +417,7 @@ describe("ranking signals", () => {
     const memoryScore = adjustSearchScore({
       datasetKey: "memory",
       baseScore: 0.5,
-      signals: { recallCount: 0, searchHitCount: 0, forgetCount: 0 },
+      signals: { recallCount: 0, searchHitCount: 0, reinforcementCount: 0, confirmedUsefulCount: 0, forgetCount: 0 },
       fileMtimeMs: 0,
       now: 120 * 86_400_000,
       cfg,
@@ -412,12 +425,49 @@ describe("ranking signals", () => {
     const libraryScore = adjustSearchScore({
       datasetKey: "library",
       baseScore: 0.5,
-      signals: { recallCount: 0, searchHitCount: 0, forgetCount: 0 },
+      signals: { recallCount: 0, searchHitCount: 0, reinforcementCount: 0, confirmedUsefulCount: 0, forgetCount: 0 },
       fileMtimeMs: 0,
       now: 120 * 86_400_000,
       cfg,
     });
 
     expect(libraryScore).toBeGreaterThan(memoryScore);
+  });
+
+  it("uses explicit reinforcement to slow decay without making hits alone stronger", () => {
+    const cfg = resolveConfig({});
+    const withHitsOnly = adjustSearchScore({
+      datasetKey: "memory",
+      baseScore: 0.55,
+      signals: {
+        recallCount: 4,
+        searchHitCount: 6,
+        reinforcementCount: 0,
+        confirmedUsefulCount: 0,
+        forgetCount: 0,
+        lastHitAt: 30 * 86_400_000,
+        lastRecallAt: 30 * 86_400_000,
+      },
+      fileMtimeMs: 0,
+      now: 120 * 86_400_000,
+      cfg,
+    });
+    const reinforced = adjustSearchScore({
+      datasetKey: "memory",
+      baseScore: 0.55,
+      signals: {
+        recallCount: 1,
+        searchHitCount: 1,
+        reinforcementCount: 2,
+        confirmedUsefulCount: 0,
+        forgetCount: 0,
+        lastReinforcedAt: 110 * 86_400_000,
+      },
+      fileMtimeMs: 0,
+      now: 120 * 86_400_000,
+      cfg,
+    });
+
+    expect(reinforced).toBeGreaterThan(withHitsOnly);
   });
 });

@@ -86,8 +86,13 @@ type ResolvedCogneePluginConfig = {
   retainedAssetMaxBytes?: number;
   retainedAssetMaxCount?: number;
   rankingPolicies: Record<DatasetKey, {
-    dailyDecay: number;
-    maxDecay: number;
+    baseHalfLifeDays: number;
+    minFreshnessMultiplier: number;
+    reinforcementFreshnessHalfLifeDays: number;
+    reinforcementFactor: number;
+    maxHalfLifeMultiplier: number;
+    forgetPenalty: number;
+    deprioritizedPenalty: number;
     staleDays: number;
     deprioritizedGraceDays: number;
   }>;
@@ -124,9 +129,13 @@ type SyncIndex = {
 type RankingSignals = {
   recallCount: number;
   searchHitCount: number;
+  reinforcementCount: number;
+  confirmedUsefulCount: number;
   forgetCount: number;
   lastHitAt?: number;
   lastRecallAt?: number;
+  lastReinforcedAt?: number;
+  lastConfirmedUsefulAt?: number;
   lastForgotAt?: number;
   lastStoredAt?: number;
   lastDeprioritizedAt?: number;
@@ -327,14 +336,26 @@ const DEFAULT_MEMORY_STORE_MAX_CHARS = 4_000;
 const DEFAULT_SUMMARY_MAX_TOKENS = 900;
 const DEFAULT_RETAINED_ASSET_WARN_BYTES = 512 * 1024 * 1024;
 const DEFAULT_RETAINED_ASSET_WARN_COUNT = 500;
-const DEFAULT_MEMORY_DAILY_DECAY = 0.01;
-const DEFAULT_LIBRARY_DAILY_DECAY = 0.0025;
-const DEFAULT_MEMORY_MAX_DECAY = 0.4;
-const DEFAULT_LIBRARY_MAX_DECAY = 0.15;
+const DEFAULT_MEMORY_BASE_HALF_LIFE_DAYS = 45;
+const DEFAULT_LIBRARY_BASE_HALF_LIFE_DAYS = 180;
+const DEFAULT_MEMORY_MIN_FRESHNESS_MULTIPLIER = 0.6;
+const DEFAULT_LIBRARY_MIN_FRESHNESS_MULTIPLIER = 0.85;
+const DEFAULT_REINFORCEMENT_FRESHNESS_HALF_LIFE_DAYS = 30;
+const DEFAULT_MEMORY_REINFORCEMENT_FACTOR = 0.55;
+const DEFAULT_LIBRARY_REINFORCEMENT_FACTOR = 0.2;
+const DEFAULT_MAX_HALF_LIFE_MULTIPLIER = 3;
+const DEFAULT_FORGET_PENALTY = 0.12;
+const DEFAULT_DEPRIORITIZED_PENALTY = 0.25;
 const DEFAULT_MEMORY_STALE_DAYS = 90;
 const DEFAULT_LIBRARY_STALE_DAYS = 365;
 const DEFAULT_MEMORY_DEPRIORITIZED_GRACE_DAYS = 30;
 const DEFAULT_LIBRARY_DEPRIORITIZED_GRACE_DAYS = 180;
+const LOW_SIGNAL_MIN_TOKEN_COUNT = 10;
+const LOW_SIGNAL_MIN_CJK_TOKEN_COUNT = 4;
+const LOCAL_QUERY_CONTENT_EXACT_WEIGHT = 0.45;
+const LOCAL_QUERY_PATH_EXACT_WEIGHT = 0.35;
+const LOCAL_QUERY_TOKEN_OVERLAP_WEIGHT = 0.4;
+const RELATION_DUPLICATE_TOKEN_CONTAINMENT_THRESHOLD = 0.9;
 const DEFAULT_MEMORY_AUTO_INDEX = true;
 const DEFAULT_MEMORY_AUTO_COGNIFY = true;
 const DEFAULT_MEMORY_AUTO_RECALL = true;
@@ -346,6 +367,7 @@ const RETRY_BASE_DELAY_MS = 3_000;
 const TOOL_NOTE_DIRNAME = "_tool";
 const MANAGED_BY_MARKER = "memory-cognee-revised";
 const LEGACY_MANAGED_BY_MARKERS = new Set(["cognee-openclaw", "memory-cognee-revised"]);
+const GREETING_ONLY_PATTERN = /^(hi|hello|hey|yo|greetings|good morning|good afternoon|good evening|thanks|thank you|你好|您好|嗨|哈喽|早上好|下午好|晚上好)$/;
 
 const COGNEE_ROOT = join(homedir(), ".openclaw", "memory", "cognee");
 const STATE_PATH = join(COGNEE_ROOT, "datasets.json");
@@ -544,6 +566,26 @@ function normalizeMemoryBodyForDedupe(text: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+}
+
+function tokenizeNaturalText(text: string): string[] {
+  return (text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]|[\p{L}\p{N}]+/gu) ?? [])
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function isGreetingLikeText(text: string): boolean {
+  const normalized = normalizeMemoryBodyForDedupe(text);
+  if (!normalized) return false;
+  return GREETING_ONLY_PATTERN.test(normalized);
+}
+
+function isLowSignalMemoryText(text: string): boolean {
+  const body = parseSimpleFrontmatter(text).body;
+  const tokens = tokenizeNaturalText(body);
+  const hasCjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(body);
+  const minTokenCount = hasCjk ? LOW_SIGNAL_MIN_CJK_TOKEN_COUNT : LOW_SIGNAL_MIN_TOKEN_COUNT;
+  return isGreetingLikeText(body) || tokens.length < minTokenCount;
 }
 
 function findSimilarMemoryNote(existingFiles: MemoryFile[], text: string): MemoryFile | undefined {
@@ -880,7 +922,7 @@ function datasetRankingPath(datasetKey: DatasetKey): string {
 }
 
 function defaultSignals(): RankingSignals {
-  return { recallCount: 0, searchHitCount: 0, forgetCount: 0 };
+  return { recallCount: 0, searchHitCount: 0, reinforcementCount: 0, confirmedUsefulCount: 0, forgetCount: 0 };
 }
 
 function getSignals(state: RankingState, path: string): RankingSignals {
@@ -913,6 +955,8 @@ function summarizeRanking(state: RankingState): {
   tracked: number;
   searchHits: number;
   recalls: number;
+  reinforcements: number;
+  confirmedUseful: number;
   forgets: number;
   deprioritized: number;
 } {
@@ -921,9 +965,36 @@ function summarizeRanking(state: RankingState): {
     tracked: values.length,
     searchHits: values.reduce((sum, entry) => sum + entry.searchHitCount, 0),
     recalls: values.reduce((sum, entry) => sum + entry.recallCount, 0),
+    reinforcements: values.reduce((sum, entry) => sum + entry.reinforcementCount, 0),
+    confirmedUseful: values.reduce((sum, entry) => sum + entry.confirmedUsefulCount, 0),
     forgets: values.reduce((sum, entry) => sum + entry.forgetCount, 0),
     deprioritized: values.filter((entry) => entry.deprioritized).length,
   };
+}
+
+function computeEffectiveHalfLifeDays(params: {
+  baseHalfLifeDays: number;
+  reinforcementCount: number;
+  lastReinforcedAt?: number;
+  reinforcementFactor: number;
+  reinforcementFreshnessHalfLifeDays: number;
+  maxHalfLifeMultiplier: number;
+  now?: number;
+}): number {
+  const baseHalfLifeDays = Math.max(1, params.baseHalfLifeDays);
+  if (params.reinforcementCount <= 0 || params.reinforcementFactor <= 0) {
+    return baseHalfLifeDays;
+  }
+
+  const now = params.now ?? Date.now();
+  const lastReinforcedAt = params.lastReinforcedAt ?? 0;
+  const ageDays = lastReinforcedAt > 0 ? Math.max(0, (now - lastReinforcedAt) / 86_400_000) : 365;
+  const freshnessHalfLife = Math.max(1, params.reinforcementFreshnessHalfLifeDays);
+  const freshnessFactor = Math.exp(-ageDays * (Math.LN2 / freshnessHalfLife));
+  const effectiveReinforcement = params.reinforcementCount * freshnessFactor;
+  const extension = baseHalfLifeDays * params.reinforcementFactor * Math.log1p(effectiveReinforcement);
+  const cap = baseHalfLifeDays * Math.max(1, params.maxHalfLifeMultiplier);
+  return Math.min(baseHalfLifeDays + extension, cap);
 }
 
 function adjustSearchScore(params: {
@@ -938,16 +1009,24 @@ function adjustSearchScore(params: {
   const now = params.now ?? Date.now();
   const freshness = Math.max(
     params.fileMtimeMs ?? 0,
-    signals.lastHitAt ?? 0,
-    signals.lastRecallAt ?? 0,
     signals.lastStoredAt ?? 0,
+    signals.lastReinforcedAt ?? 0,
   );
   const ageDays = freshness > 0 ? (now - freshness) / 86_400_000 : 365;
   const policy = params.cfg.rankingPolicies[params.datasetKey];
-  const decay = Math.min(policy.maxDecay, Math.max(0, ageDays) * policy.dailyDecay);
-  const boost = signals.searchHitCount * 0.03 + signals.recallCount * 0.05;
-  const penalty = signals.forgetCount * 0.12 + (signals.deprioritized ? 0.25 : 0);
-  return Number((params.baseScore + boost - penalty - decay).toFixed(6));
+  const effectiveHalfLifeDays = computeEffectiveHalfLifeDays({
+    baseHalfLifeDays: policy.baseHalfLifeDays,
+    reinforcementCount: signals.reinforcementCount,
+    lastReinforcedAt: signals.lastReinforcedAt,
+    reinforcementFactor: policy.reinforcementFactor,
+    reinforcementFreshnessHalfLifeDays: policy.reinforcementFreshnessHalfLifeDays,
+    maxHalfLifeMultiplier: policy.maxHalfLifeMultiplier,
+    now,
+  });
+  const freshnessMultiplier = policy.minFreshnessMultiplier
+    + (1 - policy.minFreshnessMultiplier) * Math.exp(-Math.max(0, ageDays) / effectiveHalfLifeDays);
+  const penalty = signals.forgetCount * policy.forgetPenalty + (signals.deprioritized ? policy.deprioritizedPenalty : 0);
+  return Number((params.baseScore * freshnessMultiplier - penalty).toFixed(6));
 }
 
 function scoreLocalQuery(query: string, file: MemoryFile): number {
@@ -956,12 +1035,12 @@ function scoreLocalQuery(query: string, file: MemoryFile): number {
   const content = file.content.toLowerCase();
   const path = file.path.toLowerCase();
   let score = 0;
-  if (content.includes(trimmed)) score += 0.45;
-  if (path.includes(trimmed)) score += 0.35;
+  if (content.includes(trimmed)) score += LOCAL_QUERY_CONTENT_EXACT_WEIGHT;
+  if (path.includes(trimmed)) score += LOCAL_QUERY_PATH_EXACT_WEIGHT;
   const tokens = trimmed.split(/[^a-z0-9]+/i).filter(Boolean);
   if (tokens.length > 0) {
     const overlap = tokens.filter((token) => content.includes(token) || path.includes(token)).length;
-    score += (overlap / tokens.length) * 0.4;
+    score += (overlap / tokens.length) * LOCAL_QUERY_TOKEN_OVERLAP_WEIGHT;
   }
   return Number(Math.min(score, 1).toFixed(6));
 }
@@ -1385,6 +1464,104 @@ function applySemanticSearchAdjustments(
   return Number((adjustedScore - MEMORY_SUPERSEDED_SCORE_PENALTY).toFixed(6));
 }
 
+function extractRelationPaths(details: Record<string, unknown>): Set<string> {
+  const refs = new Set<string>();
+  for (const key of ["derivedFrom", "corrects", "correctionOf", "supersedes", "supersededBy"] as const) {
+    const value = details[key];
+    if (!Array.isArray(value)) continue;
+    for (const item of value) {
+      if (typeof item === "string" && item.trim().length > 0) {
+        refs.add(normalizeDatasetPath(item));
+      }
+    }
+  }
+  return refs;
+}
+
+function tokenSetForStrictDedupe(text: string): Set<string> {
+  return new Set(
+    normalizeMemoryBodyForDedupe(text)
+      .split(/[^a-z0-9]+/i)
+      .filter((token) => token.length >= 3),
+  );
+}
+
+function computeTokenContainmentRatio(a: string, b: string): number {
+  const aTokens = tokenSetForStrictDedupe(a);
+  const bTokens = tokenSetForStrictDedupe(b);
+  if (aTokens.size === 0 || bTokens.size === 0) {
+    return 0;
+  }
+  let overlap = 0;
+  for (const token of aTokens) {
+    if (bTokens.has(token)) overlap += 1;
+  }
+  return overlap / Math.min(aTokens.size, bTokens.size);
+}
+
+function getCompactionFamilyId(path: string, manifest?: CompactionManifest): string | undefined {
+  if (!manifest) return undefined;
+  const normalizedPath = normalizeDatasetPath(path);
+  const artifact = manifest.artifacts.find((entry) =>
+    entry.sourcePath === normalizedPath || entry.replacementPath === normalizedPath,
+  );
+  return artifact ? `compact:${artifact.sourcePath}` : undefined;
+}
+
+function shouldSuppressRelatedDuplicate(
+  selected: RankedSearchResult,
+  candidate: RankedSearchResult,
+  manifest?: CompactionManifest,
+): boolean {
+  const selectedNorm = normalizeMemoryBodyForDedupe(selected.text);
+  const candidateNorm = normalizeMemoryBodyForDedupe(candidate.text);
+  if (selectedNorm && candidateNorm && selectedNorm === candidateNorm) {
+    return true;
+  }
+
+  const selectedFamily = getCompactionFamilyId(selected.path, manifest);
+  const candidateFamily = getCompactionFamilyId(candidate.path, manifest);
+  if (selectedFamily && candidateFamily && selectedFamily === candidateFamily) {
+    return true;
+  }
+
+  if (!selected.file || !candidate.file) {
+    return false;
+  }
+
+  const selectedDetails = buildFileSemanticDetails(selected.file, "memory");
+  const candidateDetails = buildFileSemanticDetails(candidate.file, "memory");
+  const selectedRelations = extractRelationPaths(selectedDetails);
+  const candidateRelations = extractRelationPaths(candidateDetails);
+  const relationLinked =
+    selectedRelations.has(candidate.path) ||
+    candidateRelations.has(selected.path);
+  if (!relationLinked) {
+    return false;
+  }
+
+  return computeTokenContainmentRatio(selected.text, candidate.text) >= RELATION_DUPLICATE_TOKEN_CONTAINMENT_THRESHOLD;
+}
+
+function collapseDuplicateSearchResults(
+  datasetKey: DatasetKey,
+  results: RankedSearchResult[],
+  compactionManifest?: CompactionManifest,
+): RankedSearchResult[] {
+  const selected: RankedSearchResult[] = [];
+  for (const result of results) {
+    const duplicate = selected.some((existing) =>
+      datasetKey === "memory"
+        ? shouldSuppressRelatedDuplicate(existing, result, compactionManifest)
+        : normalizeMemoryBodyForDedupe(existing.text) === normalizeMemoryBodyForDedupe(result.text),
+    );
+    if (!duplicate) {
+      selected.push(result);
+    }
+  }
+  return selected;
+}
+
 function resolveConfig(rawConfig: unknown): ResolvedCogneePluginConfig {
   const raw =
     rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)
@@ -1446,14 +1623,24 @@ function resolveConfig(rawConfig: unknown): ResolvedCogneePluginConfig {
       typeof raw.retainedAssetMaxCount === "number" ? raw.retainedAssetMaxCount : undefined,
     rankingPolicies: {
       memory: {
-        dailyDecay: DEFAULT_MEMORY_DAILY_DECAY,
-        maxDecay: DEFAULT_MEMORY_MAX_DECAY,
+        baseHalfLifeDays: DEFAULT_MEMORY_BASE_HALF_LIFE_DAYS,
+        minFreshnessMultiplier: DEFAULT_MEMORY_MIN_FRESHNESS_MULTIPLIER,
+        reinforcementFreshnessHalfLifeDays: DEFAULT_REINFORCEMENT_FRESHNESS_HALF_LIFE_DAYS,
+        reinforcementFactor: DEFAULT_MEMORY_REINFORCEMENT_FACTOR,
+        maxHalfLifeMultiplier: DEFAULT_MAX_HALF_LIFE_MULTIPLIER,
+        forgetPenalty: DEFAULT_FORGET_PENALTY,
+        deprioritizedPenalty: DEFAULT_DEPRIORITIZED_PENALTY,
         staleDays: DEFAULT_MEMORY_STALE_DAYS,
         deprioritizedGraceDays: DEFAULT_MEMORY_DEPRIORITIZED_GRACE_DAYS,
       },
       library: {
-        dailyDecay: DEFAULT_LIBRARY_DAILY_DECAY,
-        maxDecay: DEFAULT_LIBRARY_MAX_DECAY,
+        baseHalfLifeDays: DEFAULT_LIBRARY_BASE_HALF_LIFE_DAYS,
+        minFreshnessMultiplier: DEFAULT_LIBRARY_MIN_FRESHNESS_MULTIPLIER,
+        reinforcementFreshnessHalfLifeDays: DEFAULT_REINFORCEMENT_FRESHNESS_HALF_LIFE_DAYS,
+        reinforcementFactor: DEFAULT_LIBRARY_REINFORCEMENT_FACTOR,
+        maxHalfLifeMultiplier: DEFAULT_MAX_HALF_LIFE_MULTIPLIER,
+        forgetPenalty: DEFAULT_FORGET_PENALTY,
+        deprioritizedPenalty: DEFAULT_DEPRIORITIZED_PENALTY,
         staleDays: DEFAULT_LIBRARY_STALE_DAYS,
         deprioritizedGraceDays: DEFAULT_LIBRARY_DEPRIORITIZED_GRACE_DAYS,
       },
@@ -2552,7 +2739,13 @@ function computeCleanupSuggestions(
         reason = "already deprioritized and not recalled recently";
       } else if (signals.forgetCount >= 2) {
         reason = "repeatedly forgotten";
-      } else if (signals.searchHitCount === 0 && file.mtimeMs < now - policy.staleDays * 86_400_000) {
+      } else if (
+        signals.searchHitCount === 0 &&
+        signals.recallCount === 0 &&
+        signals.reinforcementCount === 0 &&
+        signals.confirmedUsefulCount === 0 &&
+        file.mtimeMs < now - policy.staleDays * 86_400_000
+      ) {
         reason = "stale and never retrieved";
       }
       return { path: file.path, adjustedScore, reason };
@@ -2602,6 +2795,8 @@ function buildDatasetHealthSummary(params: {
     `Ranking tracked: ${rankingSummary.tracked}`,
     `Ranking hits: ${rankingSummary.searchHits}`,
     `Ranking recalls: ${rankingSummary.recalls}`,
+    `Ranking reinforcements: ${rankingSummary.reinforcements}`,
+    `Ranking confirmed-useful: ${rankingSummary.confirmedUseful}`,
     `Ranking forgets: ${rankingSummary.forgets}`,
     `Deprioritized: ${rankingSummary.deprioritized}`,
     ...(typeof params.retainedAssets === "number" ? [`Retained assets: ${params.retainedAssets}`] : []),
@@ -2702,6 +2897,9 @@ async function importRetainedLibraryAsset(params: {
   }
 
   const content = await fs.readFile(absSourcePath, "utf-8");
+  if (isLowSignalMemoryText(content)) {
+    throw new Error("library import looks like a greeting or too-short low-signal note");
+  }
   const title = params.title?.trim() || inferTitleFromPathOrContent(absSourcePath, content);
   const contentHash = hashText(content);
   const sizeBytes = Buffer.byteLength(content, "utf-8");
@@ -2793,6 +2991,7 @@ async function searchDataset(params: {
 }): Promise<SearchDatasetResult> {
   const files = await collectDatasetFiles(params.datasetKey, params.workspaceDir, params.cfg);
   const fileByPath = new Map(files.map((file) => [file.path, file]));
+  const compactionManifest = params.datasetKey === "memory" ? await loadCompactionManifest() : undefined;
   const merged = new Map<string, RankedSearchResult>();
   const limit = params.limit ?? params.cfg.maxResults;
   const datasetProfile = params.cfg.datasets[params.datasetKey];
@@ -2890,10 +3089,13 @@ async function searchDataset(params: {
   }
 
   return {
-    results: [...merged.values()]
-      .filter((item) => item.adjustedScore >= params.cfg.minScore)
-      .sort((a, b) => b.adjustedScore - a.adjustedScore)
-      .slice(0, limit),
+    results: collapseDuplicateSearchResults(
+      params.datasetKey,
+      [...merged.values()]
+        .filter((item) => item.adjustedScore >= params.cfg.minScore)
+        .sort((a, b) => b.adjustedScore - a.adjustedScore),
+      compactionManifest,
+    ).slice(0, limit),
     telemetry,
   };
 }
@@ -3044,6 +3246,53 @@ const memoryCogneePlugin = {
       await saveRankingState(datasetKey, ranking);
     }
 
+    async function reinforceMemory(params: {
+      datasetKey: DatasetKey;
+      workspaceDir: string;
+      path?: string;
+      query?: string;
+    }): Promise<{ action: "reinforced"; path: string; reinforcementCount: number }> {
+      const file = await resolveFileTarget(params.datasetKey, params.workspaceDir, {
+        path: params.path,
+        query: params.query,
+      });
+      if (!file) {
+        throw new Error("No matching memory file found");
+      }
+
+      await ensureDatasetLoaded(params.datasetKey);
+      const ranking = rankingStates[params.datasetKey]!;
+      const signals = getSignals(ranking, file.path);
+      signals.reinforcementCount += 1;
+      signals.lastReinforcedAt = Date.now();
+      signals.deprioritized = false;
+      await saveRankingState(params.datasetKey, ranking);
+      return { action: "reinforced", path: file.path, reinforcementCount: signals.reinforcementCount };
+    }
+
+    async function confirmUsefulMemory(params: {
+      datasetKey: DatasetKey;
+      workspaceDir: string;
+      path?: string;
+      query?: string;
+    }): Promise<{ action: "confirmed-useful"; path: string; confirmedUsefulCount: number }> {
+      const file = await resolveFileTarget(params.datasetKey, params.workspaceDir, {
+        path: params.path,
+        query: params.query,
+      });
+      if (!file) {
+        throw new Error("No matching memory file found");
+      }
+
+      await ensureDatasetLoaded(params.datasetKey);
+      const ranking = rankingStates[params.datasetKey]!;
+      const signals = getSignals(ranking, file.path);
+      signals.confirmedUsefulCount += 1;
+      signals.lastConfirmedUsefulAt = Date.now();
+      await saveRankingState(params.datasetKey, ranking);
+      return { action: "confirmed-useful", path: file.path, confirmedUsefulCount: signals.confirmedUsefulCount };
+    }
+
     async function dropIndexedPaths(datasetKey: DatasetKey, paths: string[]): Promise<void> {
       await ensureDatasetLoaded(datasetKey);
       const syncIndex = syncIndexes[datasetKey]!;
@@ -3082,6 +3331,9 @@ const memoryCogneePlugin = {
       title?: string;
       pinned?: boolean;
     }): Promise<{ path: string; sync: SyncResult & { datasetId?: string } }> {
+      if (isLowSignalMemoryText(params.text)) {
+        throw new Error("memory text looks like a greeting or too-short low-signal note; skipping durable storage");
+      }
       const target =
         params.datasetKey === "memory" && !params.path
           ? await writeManagedMemoryNote({
@@ -3206,6 +3458,9 @@ const memoryCogneePlugin = {
       }
       if (isToolManagedMemoryFile(file)) {
         throw new Error("compact-memory is intended for handwritten or transient memory files, not existing tool-managed notes");
+      }
+      if (isLowSignalMemoryText(file.content)) {
+        throw new Error("compact-memory refused a greeting or too-short low-signal note");
       }
 
       const profile = classifyCompactionProfile(file);
@@ -3776,6 +4031,12 @@ const memoryCogneePlugin = {
                   { action: "invalid" },
                 );
               }
+              if (isLowSignalMemoryText(params.text)) {
+                return renderToolText(
+                  ["Memory text looks like a greeting or too-short low-signal note."],
+                  { action: "invalid" },
+                );
+              }
 
               if (datasetKey === "memory") {
                 const existingFiles = await collectDatasetFiles("memory", workspaceDir, cfg);
@@ -3810,6 +4071,80 @@ const memoryCogneePlugin = {
                   pinned: params.pinned ?? false,
                   scopeIgnored: typeof params.scope === "string" ? params.scope : undefined,
                   sync: stored.sync,
+                },
+              };
+            },
+          },
+          {
+            name: "memory_confirm_useful",
+            label: "Memory Confirm Useful",
+            description:
+              "Record that a recalled memory was explicitly confirmed useful. This stores user-guided signal only and does not auto-reinforce by itself.",
+            parameters: {
+              type: "object",
+              properties: {
+                path: { type: "string", description: "Exact virtual path to confirm" },
+                query: { type: "string", description: "Query used to resolve the target file" },
+                dataset: { type: "string", enum: ["memory", "library"], description: "Target dataset (default: memory)" },
+              },
+              additionalProperties: false,
+            },
+            async execute(
+              _toolCallId: string,
+              params: { path?: string; query?: string; dataset?: string },
+            ) {
+              const datasetKey = resolveDatasetKey(params.dataset);
+              const result = await confirmUsefulMemory({
+                datasetKey,
+                workspaceDir,
+                path: params.path,
+                query: params.query,
+              });
+              return {
+                content: [{ type: "text" as const, text: `Confirmed useful ${toolDisplayPath(datasetKey, result.path)}.` }],
+                details: {
+                  dataset: datasetKey,
+                  action: result.action,
+                  path: toolDisplayPath(datasetKey, result.path),
+                  virtualPath: result.path,
+                  confirmedUsefulCount: result.confirmedUsefulCount,
+                },
+              };
+            },
+          },
+          {
+            name: "memory_reinforce",
+            label: "Memory Reinforce",
+            description:
+              "Explicitly reinforce a memory file so user-confirmed memories decay more slowly. Default dataset is memory.",
+            parameters: {
+              type: "object",
+              properties: {
+                path: { type: "string", description: "Exact virtual path to reinforce" },
+                query: { type: "string", description: "Query used to resolve the target file" },
+                dataset: { type: "string", enum: ["memory", "library"], description: "Target dataset (default: memory)" },
+              },
+              additionalProperties: false,
+            },
+            async execute(
+              _toolCallId: string,
+              params: { path?: string; query?: string; dataset?: string },
+            ) {
+              const datasetKey = resolveDatasetKey(params.dataset);
+              const result = await reinforceMemory({
+                datasetKey,
+                workspaceDir,
+                path: params.path,
+                query: params.query,
+              });
+              return {
+                content: [{ type: "text" as const, text: `Reinforced ${toolDisplayPath(datasetKey, result.path)}.` }],
+                details: {
+                  dataset: datasetKey,
+                  action: result.action,
+                  path: toolDisplayPath(datasetKey, result.path),
+                  virtualPath: result.path,
+                  reinforcementCount: result.reinforcementCount,
                 },
               };
             },
@@ -3853,7 +4188,7 @@ const memoryCogneePlugin = {
           },
         ];
       },
-      { names: ["memory_search", "memory_status", "memory_get", "memory_store", "memory_forget"] },
+      { names: ["memory_search", "memory_status", "memory_get", "memory_store", "memory_confirm_useful", "memory_reinforce", "memory_forget"] },
     );
 
     api.registerCli((ctx) => {
@@ -3967,6 +4302,40 @@ const memoryCogneePlugin = {
           }
           await client.cognify({ datasetIds: [datasetId] });
           console.log(`[${datasetKey}] cognify dispatched`);
+        });
+
+      cognee
+        .command("confirm-useful")
+        .description("Record that a recalled memory was explicitly confirmed useful")
+        .option("--dataset <dataset>", "Target dataset (memory|library)", "memory")
+        .option("--path <path>", "Exact virtual path to confirm")
+        .option("--query <query>", "Query used to resolve the target memory")
+        .action(async (opts: { dataset?: string; path?: string; query?: string }) => {
+          const datasetKey = resolveDatasetKey(opts.dataset);
+          const result = await confirmUsefulMemory({
+            datasetKey,
+            workspaceDir,
+            path: opts.path,
+            query: opts.query,
+          });
+          console.log(`[${datasetKey}] confirmed useful ${toolDisplayPath(datasetKey, result.path)} (count=${result.confirmedUsefulCount})`);
+        });
+
+      cognee
+        .command("reinforce")
+        .description("Explicitly reinforce a memory so it decays more slowly")
+        .option("--dataset <dataset>", "Target dataset (memory|library)", "memory")
+        .option("--path <path>", "Exact virtual path to reinforce")
+        .option("--query <query>", "Query used to resolve the target memory")
+        .action(async (opts: { dataset?: string; path?: string; query?: string }) => {
+          const datasetKey = resolveDatasetKey(opts.dataset);
+          const result = await reinforceMemory({
+            datasetKey,
+            workspaceDir,
+            path: opts.path,
+            query: opts.query,
+          });
+          console.log(`[${datasetKey}] reinforced ${toolDisplayPath(datasetKey, result.path)} (count=${result.reinforcementCount})`);
         });
 
       cognee
@@ -4101,7 +4470,7 @@ const memoryCogneePlugin = {
             .slice(0, top);
           for (const row of rows) {
             console.log(
-              `${row.path}\tlifecycle=${inferLifecycleForPath(datasetKey, row.path, compactionManifest)}\tscore=${row.adjustedScore.toFixed(3)}\thits=${row.signals.searchHitCount}\trecalls=${row.signals.recallCount}\tforgets=${row.signals.forgetCount}`,
+              `${row.path}\tlifecycle=${inferLifecycleForPath(datasetKey, row.path, compactionManifest)}\tscore=${row.adjustedScore.toFixed(3)}\thits=${row.signals.searchHitCount}\trecalls=${row.signals.recallCount}\tconfirmed=${row.signals.confirmedUsefulCount}\treinforced=${row.signals.reinforcementCount}\tforgets=${row.signals.forgetCount}`,
             );
           }
         });
@@ -4372,6 +4741,7 @@ export {
   buildFileSemanticDetails,
   buildMemoryDisplayFlags,
   applySemanticSearchAdjustments,
+  isLowSignalMemoryText,
   summarizeRetainedCapacity,
   buildRetainedCapacityLines,
   computeRetainedCleanupSuggestions,
