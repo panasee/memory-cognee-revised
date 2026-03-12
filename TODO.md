@@ -403,7 +403,7 @@ Likely direction:
 
 ## 18. Add Tests For Dataset-Specific Knowledge Models
 
-Status: partial
+Status: completed
 
 Add tests for:
 
@@ -414,8 +414,3 @@ Add tests for:
 - document-level provenance preservation in `library`
 - `memory` correction-chain metadata handling
 - `library` retained/mirror metadata handling
-
-Remaining work:
-
-- add tests for retrieval-layer semantic details exposed through `memory_search` / `memory_get`
-- add tests for future correction-chain metadata once that structure is implemented
